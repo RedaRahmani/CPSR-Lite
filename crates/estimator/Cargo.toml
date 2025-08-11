@@ -1,0 +1,11 @@
+[package]
+name = "cpsr-estimator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solana-program = "1.18.21"
+cpsr-types = { path = "../types" }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+thiserror = "1"

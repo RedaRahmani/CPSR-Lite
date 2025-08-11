@@ -1,0 +1,17 @@
+[package]
+name = "cpsr-types"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+solana-program = "1.18.21"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+bincode = "1"
+blake3 = "1"
+thiserror = "1"
+bytemuck = { version = "1", features = ["derive"] }
+
+[features]
+# Keep it generic; no anchor deps here.
+default = []
