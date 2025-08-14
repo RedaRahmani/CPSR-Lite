@@ -2,6 +2,11 @@ use solana_program::{instruction::{AccountMeta, Instruction}, pubkey::Pubkey};
 use serde::{Serialize, Deserialize};
 use cpsr_types::{UserIntent, AccountVersion, Hash32};
 
+/// The blueprint for adapters (one adapter per DeFi program, like a driver for each type of machine)
+/// Keeps the system modular — you can add support for new protocols without rewriting the core.
+/// Bundler calls adapters to produce intents from user requests.
+
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
     #[error("invalid parameters: {0}")]

@@ -2,6 +2,8 @@ use serde::{Serialize, Deserialize};
 use solana_program::pubkey::Pubkey;
 use crate::hash::{Hash32, blake3_concat};
 
+/// A snapshot of an account’s state at a moment in time — balance, owner, data, and the blockchain slot.
+/// So we can check later if the account changed before we run the transaction (avoids stale data).
 /// Minimal state fingerprint used for OCC checks.
 /// Keep small: verified on-chain for touched accounts only.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

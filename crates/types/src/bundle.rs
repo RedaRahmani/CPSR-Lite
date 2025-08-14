@@ -2,6 +2,10 @@ use serde::{Serialize, Deserialize};
 use crate::hash::Hash32;
 use crate::intent::UserIntent;
 use crate::version::AccountVersion;
+/// A structure that contains many chunks, each with transactions, OCC snapshots, and Merkle roots.
+/// This is the “final package” we send to the blockchain.
+/// Built by bundler, consumed by coordinator.
+
 
 /// A chunk is the atomic unit we submit (under CU/size limits)
 #[derive(Debug, Clone, Serialize, Deserialize)]

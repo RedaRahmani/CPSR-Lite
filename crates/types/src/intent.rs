@@ -1,6 +1,11 @@
 use serde::{Serialize, Deserialize};
 use solana_program::{pubkey::Pubkey, instruction::Instruction};
 
+// This is the definition of a User Intent — basically “what a user wants to do” plus which accounts it touches.
+/// Example: “Swap 5 USDC for SOL using Raydium pool” → will touch Alice’s wallet (read+write) and the pool account (read+write).
+// Adapters create them, the DAG uses them to find conflicts, OCC checks them for freshness.
+/// a clean way to represent transactions before we actually build Solana instructions.
+
 /// Access intent: do we plan to read or write an account?
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AccessKind { ReadOnly, Writable }
