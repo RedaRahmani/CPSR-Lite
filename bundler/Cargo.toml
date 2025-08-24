@@ -1,0 +1,23 @@
+[package]
+name = "bundler"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bundler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cpsr-lite-runner"
+path = "src/bin/cpsr-lite-runner.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+# Match the Solana version you use across the repo
+solana-program = "1.18.26"
+cpsr_types = { package = "cpsr-types", path = "../crates/types" }
+blake3 = "1"                 # <-- add this
+solana-pubkey = "2"
+ctrlc = "3.4"
+

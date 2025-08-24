@@ -16,7 +16,7 @@ pub struct AccountVersion {
     /// Slot at which this fingerprint was taken (monotonic)
     pub slot: u64,
 }
-
+/*
 impl AccountVersion {
     pub fn digest(&self) -> Hash32 {
         let mut parts = Vec::with_capacity(4 + 8 + 32 + 8);
@@ -28,7 +28,7 @@ impl AccountVersion {
         crate::hash::blake3_concat(&parts.iter().map(|v| v.as_slice()).collect::<Vec<_>>())
     }
 }
-/*
+*/
 impl AccountVersion {
     pub fn digest(&self) -> Hash32 {
         let parts: [&[u8]; 5] = [
@@ -41,4 +41,4 @@ impl AccountVersion {
         blake3_concat(&parts)
     }
 }
-*/
+

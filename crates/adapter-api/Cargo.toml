@@ -9,3 +9,4 @@ cpsr-types = { path = "../types" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 thiserror = "1"
+serde_json = "1"

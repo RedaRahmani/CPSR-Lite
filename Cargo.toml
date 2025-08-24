@@ -1,0 +1,8 @@
+[workspace]
+members = [
+  "bundler",
+  "crates/adapter-api",
+  "crates/estimator",
+  "crates/types",
+]
+resolver = "2"
