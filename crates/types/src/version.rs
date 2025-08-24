@@ -2,36 +2,34 @@ use serde::{Serialize, Deserialize};
 use solana_program::pubkey::Pubkey;
 use crate::hash::{Hash32, blake3_concat};
 
-/// A snapshot of an account’s state at a moment in time — balance, owner, data, and the blockchain slot.
-/// So we can check later if the account changed before we run the transaction (avoids stale data).
-/// Minimal state fingerprint used for OCC checks.
-/// Keep small: verified on-chain for touched accounts only.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AccountVersion {
+    #[serde(with = "crate::serde::serde_pubkey")]
     pub key: Pubkey,
     pub lamports: u64,
+    #[serde(with = "crate::serde::serde_pubkey")]
     pub owner: Pubkey,
-    /// 64-bit truncated data hash to keep it compact; compute off-chain via blake3.
+    /// 64-bit truncated data hash (computed off-chain)
     pub data_hash64: u64,
-    /// Slot at which this fingerprint was taken (monotonic)
+    /// Slot at which this snapshot was taken
     pub slot: u64,
 }
-/*
-impl AccountVersion {
-    pub fn digest(&self) -> Hash32 {
-        let mut parts = Vec::with_capacity(4 + 8 + 32 + 8);
-        parts.push(self.key.as_ref());
-        parts.push(&self.lamports.to_le_bytes());
-        parts.push(self.owner.as_ref());
-        parts.push(&self.data_hash64.to_le_bytes());
-        parts.push(&self.slot.to_le_bytes());
-        crate::hash::blake3_concat(&parts.iter().map(|v| v.as_slice()).collect::<Vec<_>>())
+
+impl Ord for AccountVersion {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.key.cmp(&other.key).then(self.slot.cmp(&other.slot))
     }
 }
-*/
+impl PartialOrd for AccountVersion {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) }
+}
+
 impl AccountVersion {
+    /// Domain-separated digest for OCC tree leaves.
     pub fn digest(&self) -> Hash32 {
-        let parts: [&[u8]; 5] = [
+        const TAG: &[u8] = b"CPSR:ACCV1";
+        let parts: [&[u8]; 6] = [
+            TAG,
             self.key.as_ref(),
             &self.lamports.to_le_bytes(),
             self.owner.as_ref(),
@@ -41,4 +39,3 @@ impl AccountVersion {
         blake3_concat(&parts)
     }
 }
-

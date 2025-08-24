@@ -129,31 +129,40 @@ impl Dag {
 
         // For each account, impose a chain over participants when a writer is involved.
         let mut conflict_buf: Vec<Conflict> = Vec::new();
+        // inside Dag::build (replace the per-account loop)
         for (account, mut parts) in by_account {
-            // Fast path: if all are read-only, skip (no ordering needed).
+            // Skip pure R/R
             if parts.iter().all(|p| matches!(p.access, AccessKind::ReadOnly)) {
                 continue;
             }
             // Sort by deterministic key: priority desc, index asc.
             parts.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
 
-            // Create chain edges u -> v along the sorted list.
-            for pair in parts.windows(2) {
-                let u = pair[0].node;
-                let v = pair[1].node;
-                // Avoid self-loops and duplicates
-                if u != v && dag.edge_set.insert((u, v)) {
-                    dag.edges[u as usize].push(v);
-                    dag.rev_edges[v as usize].push(u);
-                    conflict_buf.push(Conflict {
-                        account,
-                        a: u,
-                        b: v,
-                        kind: ConflictKind::WriteInvolved,
-                    });
+            // From each writer, add edges to every later participant.
+            let mut writer_positions: Vec<(usize, NodeId)> = Vec::new();
+            for (pos, p) in parts.iter().enumerate() {
+                if matches!(p.access, AccessKind::Writable) {
+                    writer_positions.push((pos, p.node));
+                }
+            }
+            for (wpos, wnode) in writer_positions {
+                for later in parts.iter().skip(wpos + 1) {
+                    let u = wnode;
+                    let v = later.node;
+                    if u != v && dag.edge_set.insert((u, v)) {
+                        dag.edges[u as usize].push(v);
+                        dag.rev_edges[v as usize].push(u);
+                        conflict_buf.push(Conflict {
+                            account,
+                            a: u,
+                            b: v,
+                            kind: ConflictKind::WriteInvolved,
+                        });
+                    }
                 }
             }
         }
+
 
         // Deduplicate conflicts by (account, a, b)
         let mut uniq = HashSet::new();

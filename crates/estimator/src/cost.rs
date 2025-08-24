@@ -11,3 +11,9 @@ pub fn apply_safety(cu: u32, slack: u32, pct: u8) -> CuEstimate {
     let with = cu.saturating_add(slack).saturating_add(pct_add as u32);
     CuEstimate { cu, cu_with_safety: with }
 }
+
+pub fn apply_safety_with_cap(cu: u32, slack: u32, pct: u8, cap: u32) -> CuEstimate {
+    let base = apply_safety(cu, slack, pct).cu_with_safety;
+    CuEstimate { cu, cu_with_safety: base.min(cap) }
+}
+

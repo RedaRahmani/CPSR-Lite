@@ -6,3 +6,4 @@ pub mod chunker;
 pub mod serializer;
 pub mod executor;
 pub mod storage;
+pub use crate::chunking::*;

@@ -216,26 +216,20 @@ pub fn capture_occ_with_retries<F: AccountFetcher>(
                         allowed: cfg.max_slot_drift,
                     });
                 }
-                // Backoff and retry to try to catch a tighter slot window
-                thread::sleep(Duration::from_millis(backoff_ms));
+                let jitter: u64 = thread_rng().gen_range(0..10);
+                thread::sleep(std::time::Duration::from_millis(backoff_ms + jitter));
                 backoff_ms = backoff_ms.saturating_mul(2).min(5_000);
             }
             Err(e0) => {
-                // Normalize certain RPC messages to strong variants (e.g., Unauthorized).
                 let e = map_rpc_variant(e0);
-                if e.is_fatal() {
-                    return Err(e);
-                }
-                if attempt >= cfg.max_retries {
-                    return Err(OccError::RetriesExhausted);
-                }
-                // Transient; backoff and retry.
-                thread::sleep(Duration::from_millis(backoff_ms));
+                if e.is_fatal() { return Err(e); }
+                if attempt >= cfg.max_retries { return Err(OccError::RetriesExhausted); }
+                let jitter: u64 = thread_rng().gen_range(0..10);
+                thread::sleep(std::time::Duration::from_millis(backoff_ms + jitter));
                 backoff_ms = backoff_ms.saturating_mul(2).min(5_000);
             }
         }
     }
-}
 
 /// Single-shot OCC capture without retries.
 fn capture_once<F: AccountFetcher>(

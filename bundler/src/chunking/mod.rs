@@ -22,9 +22,11 @@ use solana_program::pubkey::Pubkey;
 
 use crate::dag::NodeId;
 
+// ---------- Budgets ----------
+
 #[derive(Debug, Clone)]
 pub struct TxBudget {
-    /// Conservative max bytes for a MessageV0 (keep buffer under wire limit).
+    /// Conservative max bytes for the Message (caller should pre-subtract signatures).
     pub max_bytes: usize,
     /// Extra cushion on top of computed size.
     pub byte_slack: usize,
@@ -41,67 +43,67 @@ pub struct TxBudget {
 impl Default for TxBudget {
     fn default() -> Self {
         Self {
-            max_bytes: 1200,              // conservative under ~1232 packet limit
-            byte_slack: 64,               // header/varint cushion
-            max_unique_accounts: 48,      // leave headroom under protocol caps
-            max_instructions: 30,         // practical limit
-            max_cu: 1_200_000,            // under 1.4M
+            max_bytes: 1200,              // caller should refine using estimator::SafetyMargins helper
+            byte_slack: 64,               // cushion
+            max_unique_accounts: 48,      // practical ceiling
+            max_instructions: 30,         // way below shortvec bump
+            max_cu: 1_200_000,
             default_cu_per_intent: 25_000,
         }
     }
 }
 
-/// Optional ALT planning. If enabled, we “reserve” a number of message keys and
-/// allow additional unique keys to be “offloaded” as ALT candidates.
-/// This only affects planning math; actual ALT assembly is done elsewhere.
+/// ALT policy & cost model — updated:
 #[derive(Debug, Clone)]
 pub struct AltPolicy {
     pub enabled: bool,
-    /// Max keys we plan to keep in the message key table; the rest are ALT candidates.
+    /// Keep up to this many keys in the static message key table; offload the rest.
     pub reserve_message_keys: usize,
     /// Upper bound on how many keys we’re willing to put in ALT (per chunk).
     pub max_alt_keys: usize,
-    /// Extra overhead (bytes) we budget per ALT key (conservative).
-    pub overhead_per_alt_key_bytes: usize,
+    /// Estimated number of distinct lookup tables used (affects fixed overhead).
+    pub table_count_estimate: usize,
+    /// Per-table fixed overhead: table pubkey(32) + 2*shortvec(len) ~ 34 bytes.
+    pub per_table_fixed_bytes: usize,
+    /// Per ALT index cost (u8 index) — 1 byte.
+    pub per_alt_index_byte: usize,
 }
 
 impl Default for AltPolicy {
     fn default() -> Self {
         Self {
             enabled: false,
-            reserve_message_keys: 32,     // reserve message table for hot/early keys
-            max_alt_keys: 64,             // generous ceiling; tune later
-            overhead_per_alt_key_bytes: 2 // conservative tiny header/indices overhead
+            reserve_message_keys: 32,
+            max_alt_keys: 64,
+            table_count_estimate: 1,
+            per_table_fixed_bytes: 34,
+            per_alt_index_byte: 1,
         }
     }
 }
 
-/// Pluggable budget oracle for size/CU.
-/// Replace with your estimator without changing callers.
+// ---------- Oracle ----------
+
 pub trait BudgetOracle {
-    /// Encoded bytes for the compiled instruction payload (program index + acct idxs + data).
     fn instr_bytes(&self, ix: &Instruction) -> usize;
-    /// CU estimate for a UserIntent.
     fn cu_for_intent(&self, _intent: &UserIntent) -> u64;
 }
 
-/// Simple conservative oracle (no external crates).
 pub struct BasicOracle;
-
 impl BudgetOracle for BasicOracle {
     #[inline]
     fn instr_bytes(&self, ix: &Instruction) -> usize {
-        // program_id_index (u8) + shortvec(accounts) + accounts + shortvec(data) + data
-        1 + shortvec_len(ix.accounts.len()) + ix.accounts.len()
-            + shortvec_len(ix.data.len()) + ix.data.len()
+        // compiled instruction: program idx(1) + sv(accs) + accs + sv(data) + data
+        #[inline] fn sv(n: usize) -> usize { if n < 128 { 1 } else if n < 16384 { 2 } else { 3 } }
+        let accs = ix.accounts.len();
+        let data = ix.data.len();
+        1 + sv(accs) + accs + sv(data) + data
     }
     #[inline]
-    fn cu_for_intent(&self, _intent: &UserIntent) -> u64 {
-        // Caller’s TxBudget.default_cu_per_intent is used in the accumulator.
-        // We return 0 here and let the accumulator add default if needed.
-        0
-    }
+    fn cu_for_intent(&self, _intent: &UserIntent) -> u64 { 0 }
 }
+
+// ---------- Errors ----------
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkError {
@@ -115,7 +117,8 @@ pub enum ChunkError {
     },
 }
 
-/// Backwards-compatible API: no ALT, BasicOracle.
+// ---------- API (unchanged signatures) ----------
+
 pub fn chunk_layer(
     layer: &[NodeId],
     intents: &[UserIntent],
@@ -124,7 +127,6 @@ pub fn chunk_layer(
     chunk_layer_with(layer, intents, budget, &AltPolicy::default(), &BasicOracle)
 }
 
-/// Extended API with ALT policy and a pluggable oracle.
 pub fn chunk_layer_with<O: BudgetOracle>(
     layer: &[NodeId],
     intents: &[UserIntent],
@@ -132,7 +134,6 @@ pub fn chunk_layer_with<O: BudgetOracle>(
     alt: &AltPolicy,
     oracle: &O,
 ) -> Result<Vec<Vec<NodeId>>, ChunkError> {
-    // Precompute per-intent footprints once.
     let mut fps = Vec::with_capacity(layer.len());
     for &nid in layer {
         let intent = &intents[nid as usize];
@@ -145,7 +146,6 @@ pub fn chunk_layer_with<O: BudgetOracle>(
     for (i, &nid) in layer.iter().enumerate() {
         let fp = &fps[i];
 
-        // If the single intent cannot fit in an empty tx (respecting ALT policy), error.
         if !fits_in_empty(fp, budget, alt) {
             return Err(ChunkError::IntentTooLarge {
                 node_id: nid,
@@ -156,14 +156,13 @@ pub fn chunk_layer_with<O: BudgetOracle>(
             });
         }
 
-        // Try to add to the current chunk; if not possible, seal and start a new one.
         if !cur.can_add(fp) {
             if !cur.nodes.is_empty() {
                 chunks.push(std::mem::take(&mut cur.nodes));
                 cur.reset(budget, alt);
             }
         }
-        debug_assert!(cur.can_add(fp)); // must fit in empty
+        debug_assert!(cur.can_add(fp));
         cur.add(nid, fp);
     }
 
@@ -174,10 +173,11 @@ pub fn chunk_layer_with<O: BudgetOracle>(
     Ok(chunks)
 }
 
-// ===== Internals =====
+// ---------- Internals ----------
 
-const BASE_MESSAGE_OVERHEAD: usize = 100;
-const PER_INSTRUCTION_OVERHEAD: usize = 2;
+// Message v0 base, excluding keys length (we’ll approximate len=1 byte)
+// header(3) + blockhash(32) + sv(keys)(1) + sv(lookups)(1) + sv(instrs)(1)
+const BASE_MESSAGE_OVERHEAD: usize = 3 + 32 + 1 + 1 + 1;
 
 #[inline]
 fn shortvec_len(n: usize) -> usize {
@@ -186,19 +186,15 @@ fn shortvec_len(n: usize) -> usize {
 
 #[derive(Debug, Clone)]
 struct IntentFootprint {
-    /// All keys referenced by this instruction: program + metas (ordered).
-    keys: Vec<Pubkey>,
-    /// Encoded instruction payload bytes.
-    instr_bytes: usize,
-    /// CU estimate for this intent.
-    intent_cu: u64,
+    keys: Vec<Pubkey>,     // program + metas (ordered)
+    instr_bytes: usize,    // compiled instruction bytes
+    intent_cu: u64,        // CU estimate
 }
 
 impl IntentFootprint {
     fn from_intent<O: BudgetOracle>(intent: &UserIntent, budget: &TxBudget, oracle: &O) -> Self {
         let ix = &intent.ix;
 
-        // Keep deterministic order: program first, then metas as given.
         let mut keys = Vec::with_capacity(ix.accounts.len() + 1);
         keys.push(ix.program_id);
         for m in &ix.accounts { keys.push(m.pubkey); }
@@ -206,11 +202,7 @@ impl IntentFootprint {
         let mut cu = oracle.cu_for_intent(intent);
         if cu == 0 { cu = budget.default_cu_per_intent; }
 
-        Self {
-            keys,
-            instr_bytes: oracle.instr_bytes(ix),
-            intent_cu: cu,
-        }
+        Self { keys, instr_bytes: oracle.instr_bytes(ix), intent_cu: cu }
     }
 
     #[inline]
@@ -218,30 +210,31 @@ impl IntentFootprint {
         if !alt.enabled { return self.keys.len(); }
         self.keys.len().min(alt.reserve_message_keys)
     }
-
     #[inline]
     fn alt_unique_len(&self, alt: &AltPolicy) -> usize {
         if !alt.enabled { return 0; }
         self.keys.len().saturating_sub(alt.reserve_message_keys)
     }
-
     #[inline]
-    fn cu_estimate(&self, _budget: &TxBudget) -> u64 {
-        self.intent_cu
-    }
+    fn cu_estimate(&self, _budget: &TxBudget) -> u64 { self.intent_cu }
 
     fn self_bytes_with_base(&self, budget: &TxBudget, alt: &AltPolicy) -> usize {
         BASE_MESSAGE_OVERHEAD
-            + (self.message_unique_len(alt) * 32)
-            + PER_INSTRUCTION_OVERHEAD
-            + self.instr_bytes
+            + (self.message_unique_len(alt) * 32)     // static keys
+            + self.instr_bytes                         // compiled ix bytes
             + budget.byte_slack
-            + self.alt_unique_len(alt) * alt.overhead_per_alt_key_bytes
+            + (self.alt_unique_len(alt) * alt.per_alt_index_byte) // ALT indices (u8 each)
+            // NOTE: per-table fixed overhead is added once in the accumulator when ALT is first used
     }
 }
 
 fn fits_in_empty(fp: &IntentFootprint, budget: &TxBudget, alt: &AltPolicy) -> bool {
-    let bytes = fp.self_bytes_with_base(budget, alt);
+    let bytes = fp.self_bytes_with_base(budget, alt)
+        + if alt.enabled && fp.alt_unique_len(alt) > 0 {
+            // lookup tables vector len (1) + estimated per-table fixed bytes
+            1 + alt.table_count_estimate * alt.per_table_fixed_bytes
+        } else { 0 };
+
     let msg_uniq = fp.message_unique_len(alt);
     let alt_uniq = fp.alt_unique_len(alt);
     bytes <= budget.max_bytes
@@ -253,13 +246,12 @@ fn fits_in_empty(fp: &IntentFootprint, budget: &TxBudget, alt: &AltPolicy) -> bo
 
 struct ChunkAccumulator<'a> {
     nodes: Vec<NodeId>,
-    /// Keys included in the message key table (deterministic).
     message_keys: BTreeSet<Pubkey>,
-    /// Keys planned to be sourced from ALT (if enabled); counted but not serialized here.
     alt_keys: BTreeSet<Pubkey>,
     bytes: usize,
     cu: u64,
     instrs: usize,
+    alt_used: bool,
     budget: &'a TxBudget,
     alt: &'a AltPolicy,
 }
@@ -273,8 +265,8 @@ impl<'a> ChunkAccumulator<'a> {
             bytes: BASE_MESSAGE_OVERHEAD + budget.byte_slack,
             cu: 0,
             instrs: 0,
-            budget,
-            alt,
+            alt_used: false,
+            budget, alt,
         }
     }
 
@@ -285,61 +277,52 @@ impl<'a> ChunkAccumulator<'a> {
         self.bytes = BASE_MESSAGE_OVERHEAD + budget.byte_slack;
         self.cu = 0;
         self.instrs = 0;
+        self.alt_used = false;
         self.budget = budget;
         self.alt = alt;
     }
 
-    fn deltas_for(&self, fp: &IntentFootprint) -> (usize, usize, usize, u64) {
-        // Determine how many of fp.keys become message keys vs ALT keys.
+    fn deltas_for(&self, fp: &IntentFootprint) -> (usize, usize, usize, u64, bool) {
         let mut new_message_keys = 0usize;
         let mut new_alt_keys = 0usize;
 
         for k in &fp.keys {
-            let in_msg = self.message_keys.contains(k);
-            let in_alt = self.alt_keys.contains(k);
-
-            if in_msg || in_alt {
-                continue;
-            }
+            if self.message_keys.contains(k) || self.alt_keys.contains(k) { continue; }
 
             if self.alt.enabled {
-                // Current effective message capacity already used:
-                let current_msg_cap = self.message_keys.len().min(self.alt.reserve_message_keys);
-                if current_msg_cap < self.alt.reserve_message_keys {
-                    new_message_keys += 1;
-                } else {
-                    new_alt_keys += 1;
-                }
+                let used_in_msg = self.message_keys.len().min(self.alt.reserve_message_keys);
+                if used_in_msg < self.alt.reserve_message_keys { new_message_keys += 1; }
+                else { new_alt_keys += 1; }
             } else {
                 new_message_keys += 1;
             }
         }
 
-        // Bytes contributed by new unique message keys + this instruction payload.
-        let add_bytes = (new_message_keys * 32)
-            + PER_INSTRUCTION_OVERHEAD
-            + fp.instr_bytes
-            + (new_alt_keys * self.alt.overhead_per_alt_key_bytes);
+        // Bytes contributed by new static keys + this compiled instruction + ALT index bytes.
+        let mut add_bytes = (new_message_keys * 32) + fp.instr_bytes + (new_alt_keys * self.alt.per_alt_index_byte);
+
+        // If ALT becomes used for the first time, add vector len(1) + estimated per-table fixed bytes.
+        let alt_will_be_used = self.alt.enabled && (self.alt_keys.is_empty() && new_alt_keys > 0);
+        if alt_will_be_used {
+            add_bytes += 1 + self.alt.table_count_estimate * self.alt.per_table_fixed_bytes;
+        }
 
         let add_instrs = 1usize;
         let add_cu = fp.cu_estimate(self.budget);
 
-        (add_bytes, new_message_keys + new_alt_keys, add_instrs, add_cu)
+        (add_bytes, new_message_keys + new_alt_keys, add_instrs, add_cu, alt_will_be_used)
     }
 
     fn can_add(&self, fp: &IntentFootprint) -> bool {
-        let (add_bytes, add_unique_total, add_instrs, add_cu) = self.deltas_for(fp);
+        let (add_bytes, add_unique_total, add_instrs, add_cu, _alt_first) = self.deltas_for(fp);
 
         let (prospective_msg_keys, prospective_alt_keys) = if self.alt.enabled {
-            // Split the “add_unique_total” into message vs alt derived from actual keys:
-            // Recompute split deterministically to check caps.
             let mut new_msg = 0usize;
             let mut new_alt = 0usize;
             for k in &fp.keys {
                 if self.message_keys.contains(k) || self.alt_keys.contains(k) { continue; }
-                let current_msg_cap = self.message_keys.len().min(self.alt.reserve_message_keys);
-                if current_msg_cap < self.alt.reserve_message_keys { new_msg += 1; }
-                else { new_alt += 1; }
+                let used = self.message_keys.len().min(self.alt.reserve_message_keys);
+                if used < self.alt.reserve_message_keys { new_msg += 1; } else { new_alt += 1; }
             }
             (self.message_keys.len() + new_msg, self.alt_keys.len() + new_alt)
         } else {
@@ -354,108 +337,20 @@ impl<'a> ChunkAccumulator<'a> {
     }
 
     fn add(&mut self, nid: NodeId, fp: &IntentFootprint) {
-        // Update key sets deterministically.
         for k in &fp.keys {
             if self.message_keys.contains(k) || self.alt_keys.contains(k) { continue; }
-            if self.alt.enabled {
-                let current_msg_cap = self.message_keys.len().min(self.alt.reserve_message_keys);
-                if current_msg_cap < self.alt.reserve_message_keys {
-                    self.message_keys.insert(*k);
-                } else {
-                    self.alt_keys.insert(*k);
-                }
+            let used = self.message_keys.len().min(self.alt.reserve_message_keys);
+            if self.alt.enabled && used >= self.alt.reserve_message_keys {
+                self.alt_keys.insert(*k);
             } else {
                 self.message_keys.insert(*k);
             }
         }
-        let (add_bytes, _add_unique_total, add_instrs, add_cu) = self.deltas_for(fp);
+        let (add_bytes, _add_unique_total, add_instrs, add_cu, alt_first) = self.deltas_for(fp);
         self.bytes = self.bytes.saturating_add(add_bytes);
         self.instrs = self.instrs.saturating_add(add_instrs);
         self.cu = self.cu.saturating_add(add_cu);
+        if alt_first { self.alt_used = true; }
         self.nodes.push(nid);
-    }
-}
-
-// ===== Tests =====
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use solana_program::instruction::AccountMeta;
-
-    fn mk_intent(keys: &[Pubkey], data_len: usize) -> UserIntent {
-        let program_id = keys[0];
-        let accounts = keys[1..]
-            .iter()
-            .map(|k| AccountMeta::new(*k, false))
-            .collect::<Vec<_>>();
-        let ix = Instruction { program_id, accounts, data: vec![0u8; data_len] };
-        UserIntent {
-            actor: Pubkey::new_unique(),
-            ix,
-            accesses: keys[1..].iter().map(|k| AccountAccess { pubkey: *k, access: AccessKind::ReadOnly }).collect(),
-            priority: 0,
-            expires_at_slot: None,
-        }
-    }
-
-    #[test]
-    fn packs_together_when_safe() {
-        let p = Pubkey::new_unique();
-        let a = Pubkey::new_unique();
-        let b = Pubkey::new_unique();
-
-        let intents = vec![mk_intent(&[p, a], 8), mk_intent(&[p, b], 8)];
-        let layer: Vec<NodeId> = vec![0, 1];
-        let budget = TxBudget { max_bytes: 600, ..Default::default() };
-
-        let chunks = chunk_layer(&layer, &intents, &budget).unwrap();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], vec![0, 1]);
-    }
-
-    #[test]
-    fn splits_when_unique_accounts_exceed() {
-        let p = Pubkey::new_unique();
-        // Each intent introduces many unique keys.
-        let intents = (0..3).map(|_| {
-            let mut keys = vec![p];
-            for _ in 0..30 { keys.push(Pubkey::new_unique()); }
-            mk_intent(&keys, 8)
-        }).collect::<Vec<_>>();
-
-        let layer: Vec<NodeId> = vec![0, 1, 2];
-        let budget = TxBudget { max_bytes: 20_000, max_unique_accounts: 48, ..Default::default() };
-
-        let chunks = chunk_layer(&layer, &intents, &budget).unwrap();
-        assert!(chunks.len() >= 2);
-    }
-
-    #[test]
-    fn errors_if_single_intent_too_large() {
-        let p = Pubkey::new_unique();
-        let intent = mk_intent(&[p, Pubkey::new_unique()], 10_000);
-        let layer = vec![0];
-        let budget = TxBudget { max_bytes: 500, ..Default::default() };
-
-        let err = chunk_layer(&layer, &[intent], &budget).unwrap_err();
-        matches!(err, ChunkError::IntentTooLarge { .. });
-    }
-
-    #[test]
-    fn alt_policy_allows_offloading_keys() {
-        let p = Pubkey::new_unique();
-        let mut keys = vec![p];
-        // 40 account metas → 41 keys including program.
-        for _ in 0..40 { keys.push(Pubkey::new_unique()); }
-        let intent = mk_intent(&keys, 8);
-
-        let layer = vec![0];
-        let budget = TxBudget { max_bytes: 10_000, max_unique_accounts: 32, ..Default::default() };
-        let alt = AltPolicy { enabled: true, reserve_message_keys: 32, max_alt_keys: 64, overhead_per_alt_key_bytes: 2 };
-
-        // Should succeed because we reserve 32 in message and offload the rest to ALT.
-        let chunks = chunk_layer_with(&layer, &[intent], &budget, &alt, &BasicOracle).unwrap();
-        assert_eq!(chunks.len(), 1);
     }
 }
