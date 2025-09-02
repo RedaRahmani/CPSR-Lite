@@ -7,9 +7,6 @@ edition = "2021"
 name = "bundler"
 path = "src/lib.rs"
 
-[[bin]]
-name = "cpsr-lite-runner"
-path = "src/bin/cpsr-lite-runner.rs"
 
 [dependencies]
 anyhow = "1"
@@ -20,4 +17,13 @@ cpsr_types = { package = "cpsr-types", path = "../crates/types" }
 blake3 = "1"                 # <-- add this
 solana-pubkey = "2"
 ctrlc = "3.4"
+rand = "0.8"
+estimator  = { package = "cpsr-estimator", path = "../crates/estimator" }
+solana-sdk    = "1.18"
+solana-client = "1.18"
+bincode = "1"
+hex = "0.4"  
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
 

@@ -1,0 +1,133 @@
+// bundler/src/sender.rs
+use std::sync::Arc;
+
+use anyhow::{Result, anyhow};
+use solana_client::{
+    rpc_client::RpcClient,
+    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+};
+use solana_sdk::{
+    commitment_config::{CommitmentConfig, CommitmentLevel},
+    message::VersionedMessage,
+    signature::Signature,
+    signer::Signer,
+    transaction::VersionedTransaction,
+};
+use estimator::cost::apply_safety_with_cap;
+use crate::fee::{FeeOracle, FeePlan};
+
+#[derive(Clone, Debug)]
+pub struct SendReport {
+    pub signature: Option<Signature>,       // None in dry-run
+    pub used_cu: u32,                       // from simulation
+    pub final_plan: FeePlan,                // cu_limit + price used to build the final msg
+    pub message_bytes: usize,               // serialized vmsg size (no signatures)
+    pub required_signers: usize,            // from message header
+    pub base_fee_lamports: u64,             // 5000 * required_signers
+    pub priority_fee_lamports: u64,         // (cu_limit * cu_price_microLam) / 1_000_000
+    pub total_fee_lamports: u64,            // base + priority (excludes rent, etc.)
+}
+
+pub struct ReliableSender {
+    pub rpc: Arc<RpcClient>,
+    pub fee_oracle: Box<dyn FeeOracle>,
+}
+
+impl ReliableSender {
+    /// Simulate -> tighten CU limit with safety -> rebuild -> (optionally) send.
+    /// Returns a rich SendReport for cost accounting.
+    pub fn simulate_build_and_send_with_report<FBuild>(
+        &self,
+        mut build: FBuild,
+        signers: &[&dyn Signer],
+        dry_run: bool,
+    ) -> Result<SendReport>
+    where
+        FBuild: FnMut(FeePlan) -> Result<VersionedMessage>,
+    {
+        // 1) Start with oracle suggestion (clamped)
+        let plan0 = self.fee_oracle.clamp(self.fee_oracle.suggest());
+
+        // 2) Build & simulate to learn units
+        let vmsg0 = build(plan0.clone())?;
+        let tx0 = VersionedTransaction::try_new(vmsg0.clone(), signers)?;
+        let sim = self.rpc.simulate_transaction_with_config(
+            &tx0,
+            RpcSimulateTransactionConfig {
+                sig_verify: false,
+                replace_recent_blockhash: true,
+                ..Default::default()
+            },
+        )?;
+        if let Some(err) = sim.value.err {
+            return Err(anyhow!("simulation error: {:?}", err));
+        }
+        let used = sim.value.units_consumed.unwrap_or(200_000) as u32;
+
+        // 3) Apply safety + cap, clamp with oracle again
+        let safe = apply_safety_with_cap(used, 10_000, 20, plan0.cu_limit as u32);
+        let mut plan = FeePlan {
+            cu_limit: safe.cu_with_safety as u64,
+            cu_price_microlamports: plan0.cu_price_microlamports,
+        };
+        plan = self.fee_oracle.clamp(plan);
+
+        // 4) Rebuild with final plan
+        let vmsg = build(plan.clone())?;
+
+        // 5) Fee accounting
+        let message_bytes = bincode::serialize(&vmsg)?.len();
+        let required_signers = match &vmsg {
+            VersionedMessage::Legacy(m) => m.header.num_required_signatures as usize,
+            VersionedMessage::V0(m) => m.header.num_required_signatures as usize,
+        };
+        // Base fee: 5000 lamports per signature (official docs)
+        let base_fee_lamports = 5000u64 * (required_signers as u64);
+        // Priority fee: limit * price (μLam) -> lamports
+        let priority_fee_lamports = (plan.cu_limit.saturating_mul(plan.cu_price_microlamports)) / 1_000_000;
+        let mut signature = None;
+
+        if !dry_run {
+            // 6) Verify blockhash then send
+            let bh = match &vmsg {
+                VersionedMessage::Legacy(m) => m.recent_blockhash,
+                VersionedMessage::V0(m) => m.recent_blockhash,
+            };
+            let ok = self.rpc.is_blockhash_valid(&bh, CommitmentConfig::processed())?;
+            if !ok {
+                return Err(anyhow!("stale blockhash; rebuild required"));
+            }
+            let tx_final = VersionedTransaction::try_new(vmsg, signers)?;
+            let sig = self.rpc.send_transaction_with_config(
+                &tx_final,
+                RpcSendTransactionConfig {
+                    skip_preflight: false,
+                    preflight_commitment: Some(CommitmentLevel::Processed),
+                    ..Default::default()
+                },
+            )?;
+            signature = Some(sig);
+        }
+
+        let total_fee_lamports = base_fee_lamports + priority_fee_lamports;
+        Ok(SendReport {
+            signature,
+            used_cu: used,
+            final_plan: plan,
+            message_bytes,
+            required_signers,
+            base_fee_lamports,
+            priority_fee_lamports,
+            total_fee_lamports,
+        })
+    }
+
+    /// Backwards-compatible wrapper (returns only Signature like before).
+    pub fn simulate_and_send<FBuild>(&self, build: FBuild, signers: &[&dyn Signer]) -> Result<Signature>
+    where
+        FBuild: FnMut(FeePlan) -> Result<VersionedMessage>,
+    {
+        let rep = self.simulate_build_and_send_with_report(build, signers, false)?;
+        Ok(rep.signature.expect("signature missing"))
+    }
+}

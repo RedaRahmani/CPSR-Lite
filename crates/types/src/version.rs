@@ -39,3 +39,48 @@ impl AccountVersion {
         blake3_concat(&parts)
     }
 }
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    fn k() -> Pubkey { Pubkey::new_unique() }
+
+    #[test]
+    fn digest_changes_when_any_field_changes() {
+        let base = AccountVersion { key: k(), lamports: 1, owner: k(), data_hash64: 42, slot: 10 };
+        let d0 = base.digest();
+
+        let mut v = base; v.lamports = 2;                 assert_ne!(d0, v.digest());
+        v = base;        v.owner = k();                   assert_ne!(d0, v.digest());
+        v = base;        v.data_hash64 = 43;              assert_ne!(d0, v.digest());
+        v = base;        v.slot = 11;                     assert_ne!(d0, v.digest());
+        v = base;        v.key = k();                     assert_ne!(d0, v.digest());
+    }
+
+    #[test]
+    fn ord_sorts_by_key_then_slot() {
+        let key = k(); let owner = k();
+        let a = AccountVersion { key, lamports: 0, owner, data_hash64: 0, slot: 5 };
+        let b = AccountVersion { key, lamports: 0, owner, data_hash64: 0, slot: 7 };
+        let c = AccountVersion { key: k(), lamports: 0, owner, data_hash64: 0, slot: 1 };
+        let mut v = vec![b, c, a];
+        v.sort();
+        let same_key: Vec<_> = v.iter().filter(|x| x.key == key).cloned().collect();
+        assert_eq!(same_key[0].slot, 5);
+        assert_eq!(same_key[1].slot, 7);
+    }
+
+    #[test]
+    fn serde_json_uses_base58_pubkeys_and_roundtrips() {
+        let v = AccountVersion { key: k(), lamports: 3, owner: k(), data_hash64: 9, slot: 77 };
+        let j = serde_json::to_string(&v).unwrap();
+        assert!(j.contains(&format!("\"{}\"", v.key.to_string())));
+        assert!(j.contains(&format!("\"{}\"", v.owner.to_string())));
+        let back: AccountVersion = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, v);
+    }
+}

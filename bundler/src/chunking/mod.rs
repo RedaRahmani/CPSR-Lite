@@ -354,3 +354,48 @@ impl<'a> ChunkAccumulator<'a> {
         self.nodes.push(nid);
     }
 }
+
+
+
+
+#[cfg(test)]
+mod more_chunk_tests {
+    use super::*;
+    use solana_program::instruction::AccountMeta;
+
+    fn mk_intent(keys: &[Pubkey], data_len: usize) -> UserIntent {
+        let program_id = keys[0];
+        let accounts = keys[1..].iter().map(|k| AccountMeta::new(*k, false)).collect::<Vec<_>>();
+        let ix = Instruction { program_id, accounts, data: vec![0u8; data_len] };
+        UserIntent::new(Pubkey::new_unique(), ix, 0, None)
+    }
+
+    #[test]
+    fn splits_on_bytes_limit() {
+        let p = Pubkey::new_unique();
+        let a = Pubkey::new_unique();
+
+        // Two intents large enough to force separate chunks given max_bytes
+        let intents = vec![mk_intent(&[p, a], 700), mk_intent(&[p, a], 700)];
+        let layer: Vec<NodeId> = vec![0, 1];
+
+        let mut budget = TxBudget::default();
+        budget.max_bytes = 900; // intentionally low
+        let chunks = chunk_layer(&layer, &intents, &budget).unwrap();
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn splits_on_cu_limit() {
+        let p = Pubkey::new_unique();
+        let a = Pubkey::new_unique();
+        let intents = vec![mk_intent(&[p, a], 8), mk_intent(&[p, a], 8), mk_intent(&[p, a], 8)];
+        let layer: Vec<NodeId> = vec![0, 1, 2];
+
+        let mut budget = TxBudget::default();
+        budget.max_bytes = 10_000;
+        budget.max_cu = budget.default_cu_per_intent; // allow exactly one intent per chunk
+        let chunks = chunk_layer(&layer, &intents, &budget).unwrap();
+        assert_eq!(chunks.len(), 3);
+    }
+}

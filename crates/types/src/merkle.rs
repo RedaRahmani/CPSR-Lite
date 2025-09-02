@@ -19,3 +19,48 @@ pub fn merkle_root(mut leaves: Vec<Hash32>) -> Hash32 {
     }
     leaves[0]
 }
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hash::blake3_concat;
+
+    #[test]
+    fn empty_is_zero_root() {
+        assert_eq!(merkle_root(vec![]), ZERO32);
+    }
+
+    #[test]
+    fn single_leaf_is_identity() {
+        let l = blake3_concat(&[b"leaf"]);
+        assert_eq!(merkle_root(vec![l]), l);
+    }
+
+    #[test]
+    fn two_leaves_standard_pair() {
+        let a = blake3_concat(&[b"a"]);
+        let b = blake3_concat(&[b"b"]);
+        let expected = blake3_concat(&[&a, &b]);
+        assert_eq!(merkle_root(vec![a, b]), expected);
+    }
+
+    #[test]
+    fn three_leaves_duplicate_last() {
+        let a = blake3_concat(&[b"a"]);
+        let b = blake3_concat(&[b"b"]);
+        let c = blake3_concat(&[b"c"]);
+        let h1 = blake3_concat(&[&a, &b]);
+        let h2 = blake3_concat(&[&c, &c]);
+        let expected = blake3_concat(&[&h1, &h2]);
+        assert_eq!(merkle_root(vec![a, b, c]), expected);
+    }
+
+    #[test]
+    fn order_matters() {
+        let a = blake3_concat(&[b"a"]);
+        let b = blake3_concat(&[b"b"]);
+        assert_ne!(merkle_root(vec![a, b]), merkle_root(vec![b, a]));
+    }
+}

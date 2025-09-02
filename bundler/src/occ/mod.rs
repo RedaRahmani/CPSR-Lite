@@ -21,6 +21,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::thread;
 use std::time::Duration;
+use rand::{thread_rng, Rng};
 
 use cpsr_types::AccountVersion;
 use solana_program::pubkey::Pubkey;
@@ -85,6 +86,10 @@ impl Default for OccConfig {
             include_readonly: true, // OCC on all touched accounts by default
         }
     }
+}
+impl Class {
+    #[inline]
+    fn is_fatal(self) -> bool { matches!(self, Class::Fatal) }
 }
 
 /// Errors from OCC capture.
@@ -230,7 +235,7 @@ pub fn capture_occ_with_retries<F: AccountFetcher>(
             }
         }
     }
-
+}
 /// Single-shot OCC capture without retries.
 fn capture_once<F: AccountFetcher>(
     fetcher: &F,

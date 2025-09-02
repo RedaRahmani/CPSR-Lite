@@ -76,3 +76,49 @@ pub fn fold_message_size(estimates: &[SizeEstimate], bytes_slack: u32) -> u32 {
     let sum = estimates.iter().map(|e| e.instr_bytes).sum::<u32>();
     sum + bytes_slack
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_program::{instruction::{Instruction, AccountMeta}, pubkey::Pubkey};
+
+    fn ix(n_accounts: usize, data_len: usize) -> Instruction {
+        let program = Pubkey::new_unique();
+        let accounts = (0..n_accounts)
+            .map(|_| AccountMeta::new(Pubkey::new_unique(), false))
+            .collect::<Vec<_>>();
+        Instruction { program_id: program, accounts, data: vec![0u8; data_len] }
+    }
+
+    #[test]
+    fn compiled_bytes_formula() {
+        let i = ix(2, 3);
+        let b = compiled_ix_bytes(&i);
+        let sv = |n: usize| if n < 128 { 1 } else if n < 16384 { 2 } else { 3 };
+        assert_eq!(b, (1 + sv(2) + 2 + sv(3) + 3) as u32);
+    }
+
+    #[test]
+    fn message_bytes_increase_with_keys_and_lookups() {
+        let ixs = vec![ix(1, 0), ix(2, 1)];
+        let base  = V0MessageShape { message_keys: 5,  lookup_tables: vec![],      instr_count: ixs.len() };
+        let keys  = V0MessageShape { message_keys: 10, lookup_tables: vec![],      instr_count: ixs.len() };
+        let withl = V0MessageShape { message_keys: 5,  lookup_tables: vec![(2,1)], instr_count: ixs.len() };
+
+        let b0 = estimate_message_v0_bytes(&ixs, &base);
+        let b1 = estimate_message_v0_bytes(&ixs, &keys);
+        let b2 = estimate_message_v0_bytes(&ixs, &withl);
+
+        assert!(b1 > b0);
+        assert!(b2 > b0);
+    }
+
+    #[test]
+    fn sum_compiled_ix_bytes_matches_manual() {
+        let ixs = vec![ix(0, 0), ix(3, 4)];
+        let sum = sum_compiled_ix_bytes(&ixs);
+        let manual = compiled_ix_bytes(&ixs[0]) + compiled_ix_bytes(&ixs[1]);
+        assert_eq!(sum, manual);
+    }
+}
