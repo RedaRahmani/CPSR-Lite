@@ -3,6 +3,14 @@ name = "bundler"
 version = "0.1.0"
 edition = "2021"
 
+# Prevent Cargo from auto-picking up src/bin/*.rs files as binaries
+autobins = false
+
+# (Optional) If/when you really want a CLI, declare it explicitly:
+# [[bin]]
+# name = "cpsr-lite-runner"
+# path = "src/bin/cpsr-lite-runner.rs"
+
 [lib]
 name = "bundler"
 path = "src/lib.rs"

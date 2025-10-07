@@ -1,11 +1,14 @@
 use serde::{Serialize, Deserialize};
 
+/// Output of CU safety application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CuEstimate {
     pub cu: u32,
     pub cu_with_safety: u32,
 }
 
+/// Additive slack + percentage safety (e.g., +10k + 20%).
+/// Use this after simulation (units_consumed) and before building the final message.
 pub fn apply_safety(cu: u32, slack: u32, pct: u8) -> CuEstimate {
     let pct_add = (cu as u64 * pct as u64) / 100;
     let with = cu.saturating_add(slack).saturating_add(pct_add as u32);
@@ -18,9 +21,6 @@ pub fn apply_safety_with_cap(cu: u32, slack: u32, pct: u8, cap: u32) -> CuEstima
     if est.cu_with_safety > cap { est.cu_with_safety = cap; }
     est
 }
-
-
-
 
 #[cfg(test)]
 mod tests {

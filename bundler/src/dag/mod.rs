@@ -77,7 +77,7 @@ pub struct Dag {
     /// Optional conflict explanations (deduplicated).
     pub conflicts: Vec<Conflict>,
     /// Mapping from (u,v) to ensure we don't emit duplicate edges.
-    edge_set: HashSet<(NodeId, NodeId)>,
+    pub edge_set: HashSet<(NodeId, NodeId)>,
 }
 
 /// Errors that can arise when building/processing the DAG.

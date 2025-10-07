@@ -1,17 +1,6 @@
 //! CU/Size/Accounts-aware chunking for CPSR-Lite.
-//!
-//! Responsibilities
-//! - Pack a conflict-free DAG layer (NodeIds) into transaction-sized chunks.
-//! - Enforce budgets: message bytes, unique accounts, instruction count, CU.
-//! - Stay deterministic: preserve the layer’s order (no re-sorting).
-//! - Be future-proof: optional Address Lookup Table (ALT) pre-planning.
-//! - Be pluggable: replace heuristics with a real estimator without changing callers.
-//!
-//! Notes
-//! - This module makes conservative size assumptions and includes slack to avoid edge
-//!   underestimation. When you wire in your estimator crate, it will get tighter.
-//! - ALT policy is optional here and only affects *planning math*. Actual ALT assembly
-//!   belongs in serializer/planner; this prepares the counts and enforces limits.
+//
+// (unchanged module docs)
 
 use std::collections::BTreeSet;
 
@@ -89,11 +78,48 @@ pub trait BudgetOracle {
     fn cu_for_intent(&self, _intent: &UserIntent) -> u64;
 }
 
+/// v1 heuristic CU oracle:
+/// - baseline per instruction
+/// - + per-account cost (heavier for writable)
+/// - + data-size slope
+///
+/// This is intentionally simple and deterministic. Replace with program-aware tables later.
+#[derive(Debug, Clone, Default)]
+pub struct ProgramAwareOracle;
+
+impl BudgetOracle for ProgramAwareOracle {
+    #[inline]
+    fn instr_bytes(&self, ix: &Instruction) -> usize {
+        // compiled instruction: program idx(1) + sv(accs) + accs + sv(data) + data
+        #[inline] fn sv(n: usize) -> usize { if n < 128 { 1 } else if n < 16384 { 2 } else { 3 } }
+        let accs = ix.accounts.len();
+        let data = ix.data.len();
+        1 + sv(accs) + accs + sv(data) + data
+    }
+
+    #[inline]
+    fn cu_for_intent(&self, intent: &UserIntent) -> u64 {
+        // Baselines chosen conservatively to avoid underestimation spikes.
+        // You’ll later swap to a table keyed by (program, ix discriminant) + params.
+        let accs = &intent.ix.accounts;
+        let data_len = intent.ix.data.len();
+
+        let base: u64 = 12_000; // baseline per ix
+        let mut per_acc: u64 = 0;
+        for m in accs {
+            per_acc += if m.is_writable { 2_500 } else { 1_000 };
+        }
+        let data_term: u64 = (data_len as u64).saturating_mul(30); // ~30 CU per byte (heuristic)
+
+        base + per_acc + data_term
+    }
+}
+
+/// Legacy trivial oracle (kept for tests/back-compat).
 pub struct BasicOracle;
 impl BudgetOracle for BasicOracle {
     #[inline]
     fn instr_bytes(&self, ix: &Instruction) -> usize {
-        // compiled instruction: program idx(1) + sv(accs) + accs + sv(data) + data
         #[inline] fn sv(n: usize) -> usize { if n < 128 { 1 } else if n < 16384 { 2 } else { 3 } }
         let accs = ix.accounts.len();
         let data = ix.data.len();
@@ -124,7 +150,9 @@ pub fn chunk_layer(
     intents: &[UserIntent],
     budget: &TxBudget,
 ) -> Result<Vec<Vec<NodeId>>, ChunkError> {
-    chunk_layer_with(layer, intents, budget, &AltPolicy::default(), &BasicOracle)
+    // Use the smarter oracle by default.
+    let oracle = ProgramAwareOracle::default();
+    chunk_layer_with(layer, intents, budget, &AltPolicy::default(), &oracle)
 }
 
 pub fn chunk_layer_with<O: BudgetOracle>(
@@ -149,7 +177,7 @@ pub fn chunk_layer_with<O: BudgetOracle>(
         if !fits_in_empty(fp, budget, alt) {
             return Err(ChunkError::IntentTooLarge {
                 node_id: nid,
-                bytes: fp.self_bytes_with_base(budget, alt),
+                bytes: size_if_only_this(fp, budget, alt),
                 message_unique: fp.message_unique_len(alt),
                 alt_unique: fp.alt_unique_len(alt),
                 cu: fp.cu_estimate(budget),
@@ -175,13 +203,18 @@ pub fn chunk_layer_with<O: BudgetOracle>(
 
 // ---------- Internals ----------
 
-// Message v0 base, excluding keys length (we’ll approximate len=1 byte)
-// header(3) + blockhash(32) + sv(keys)(1) + sv(lookups)(1) + sv(instrs)(1)
-const BASE_MESSAGE_OVERHEAD: usize = 3 + 32 + 1 + 1 + 1;
+// Message v0 base excluding *all* shortvec lengths (we compute them exactly).
+// header(3) + blockhash(32)
+const BASE_MESSAGE_OVERHEAD: usize = 3 + 32;
 
 #[inline]
 fn shortvec_len(n: usize) -> usize {
     if n < 128 { 1 } else if n < 16384 { 2 } else { 3 }
+}
+
+#[inline]
+fn delta_sv(old: usize, new: usize) -> usize {
+    shortvec_len(new).saturating_sub(shortvec_len(old))
 }
 
 #[derive(Debug, Clone)]
@@ -218,22 +251,43 @@ impl IntentFootprint {
     #[inline]
     fn cu_estimate(&self, _budget: &TxBudget) -> u64 { self.intent_cu }
 
-    fn self_bytes_with_base(&self, budget: &TxBudget, alt: &AltPolicy) -> usize {
-        BASE_MESSAGE_OVERHEAD
-            + (self.message_unique_len(alt) * 32)     // static keys
-            + self.instr_bytes                         // compiled ix bytes
-            + budget.byte_slack
-            + (self.alt_unique_len(alt) * alt.per_alt_index_byte) // ALT indices (u8 each)
-            // NOTE: per-table fixed overhead is added once in the accumulator when ALT is first used
+    /// Bytes contributed *by this intent only*:
+    /// - static keys (32B each) kept in message table
+    /// - compiled ix bytes
+    /// - ALT index bytes (u8 per offloaded key)
+    ///
+    /// NOTE: does NOT include:
+    /// - BASE_MESSAGE_OVERHEAD
+    /// - shortvec lengths (keys/lookups/instrs) → those depend on global counts and are handled in accumulator.
+    fn self_bytes(&self, alt: &AltPolicy) -> usize {
+        (self.message_unique_len(alt) * 32)
+            + self.instr_bytes
+            + (self.alt_unique_len(alt) * alt.per_alt_index_byte)
     }
 }
 
+fn size_if_only_this(fp: &IntentFootprint, budget: &TxBudget, alt: &AltPolicy) -> usize {
+    // Exact size if a transaction contained only this intent.
+    // BASE + slack + sv(keys=msg_uniq) + sv(lookups) + sv(instrs=1) + self-bytes + (ALT table fixed if used)
+    let msg_uniq = fp.message_unique_len(alt);
+    let alt_uniq = fp.alt_unique_len(alt);
+    let sv_keys = shortvec_len(msg_uniq);
+    let sv_instrs = shortvec_len(1);
+    // lookups vector always present in v0; 0 → 1 byte, else grows as needed
+    let table_count = if alt.enabled && alt_uniq > 0 { alt.table_count_estimate } else { 0 };
+    let sv_lookups = shortvec_len(table_count);
+
+    BASE_MESSAGE_OVERHEAD
+        + budget.byte_slack
+        + sv_keys
+        + sv_lookups
+        + sv_instrs
+        + fp.self_bytes(alt)
+        + if table_count > 0 { table_count * alt.per_table_fixed_bytes } else { 0 }
+}
+
 fn fits_in_empty(fp: &IntentFootprint, budget: &TxBudget, alt: &AltPolicy) -> bool {
-    let bytes = fp.self_bytes_with_base(budget, alt)
-        + if alt.enabled && fp.alt_unique_len(alt) > 0 {
-            // lookup tables vector len (1) + estimated per-table fixed bytes
-            1 + alt.table_count_estimate * alt.per_table_fixed_bytes
-        } else { 0 };
+    let bytes = size_if_only_this(fp, budget, alt);
 
     let msg_uniq = fp.message_unique_len(alt);
     let alt_uniq = fp.alt_unique_len(alt);
@@ -258,11 +312,18 @@ struct ChunkAccumulator<'a> {
 
 impl<'a> ChunkAccumulator<'a> {
     fn new(budget: &'a TxBudget, alt: &'a AltPolicy) -> Self {
+        // Start with BASE + slack + sv(keys=0) + sv(lookups=0) + sv(instrs=0)
+        let bytes = BASE_MESSAGE_OVERHEAD
+            + budget.byte_slack
+            + shortvec_len(0)  // keys
+            + shortvec_len(0)  // lookups
+            + shortvec_len(0); // instrs
+
         Self {
             nodes: Vec::new(),
             message_keys: BTreeSet::new(),
             alt_keys: BTreeSet::new(),
-            bytes: BASE_MESSAGE_OVERHEAD + budget.byte_slack,
+            bytes,
             cu: 0,
             instrs: 0,
             alt_used: false,
@@ -274,7 +335,11 @@ impl<'a> ChunkAccumulator<'a> {
         self.nodes.clear();
         self.message_keys.clear();
         self.alt_keys.clear();
-        self.bytes = BASE_MESSAGE_OVERHEAD + budget.byte_slack;
+        self.bytes = BASE_MESSAGE_OVERHEAD
+            + budget.byte_slack
+            + shortvec_len(0)  // keys
+            + shortvec_len(0)  // lookups
+            + shortvec_len(0); // instrs
         self.cu = 0;
         self.instrs = 0;
         self.alt_used = false;
@@ -298,13 +363,25 @@ impl<'a> ChunkAccumulator<'a> {
             }
         }
 
-        // Bytes contributed by new static keys + this compiled instruction + ALT index bytes.
-        let mut add_bytes = (new_message_keys * 32) + fp.instr_bytes + (new_alt_keys * self.alt.per_alt_index_byte);
+        // Bytes from this intent itself.
+        let mut add_bytes = fp.self_bytes(self.alt);
 
-        // If ALT becomes used for the first time, add vector len(1) + estimated per-table fixed bytes.
+        // Shortvec deltas:
+        // keys shortvec tracks *static message keys only*
+        let old_msg_keys = self.message_keys.len();
+        let new_msg_keys_total = old_msg_keys + new_message_keys;
+        add_bytes += delta_sv(old_msg_keys, new_msg_keys_total);
+
+        // instrs shortvec
+        add_bytes += delta_sv(self.instrs, self.instrs + 1);
+
+        // lookups shortvec + per-table fixed, when ALT toggles from 0 → >0
         let alt_will_be_used = self.alt.enabled && (self.alt_keys.is_empty() && new_alt_keys > 0);
         if alt_will_be_used {
-            add_bytes += 1 + self.alt.table_count_estimate * self.alt.per_table_fixed_bytes;
+            // shortvec(len) change from 0 → table_count_estimate
+            add_bytes += delta_sv(0, self.alt.table_count_estimate);
+            // add per-table fixed bytes
+            add_bytes += self.alt.table_count_estimate * self.alt.per_table_fixed_bytes;
         }
 
         let add_instrs = 1usize;
@@ -354,9 +431,6 @@ impl<'a> ChunkAccumulator<'a> {
         self.nodes.push(nid);
     }
 }
-
-
-
 
 #[cfg(test)]
 mod more_chunk_tests {

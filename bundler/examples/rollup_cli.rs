@@ -2,11 +2,11 @@
 use std::{fs, path::PathBuf, str::FromStr, time::Duration, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
-    signature::{read_keypair_file, Keypair, Signature},
+    signature::read_keypair_file,
     signer::Signer,
     system_instruction,
     pubkey::Pubkey,
@@ -17,9 +17,9 @@ use bundler::{
     chunking::{AltPolicy, BasicOracle as ChunkOracle, TxBudget, chunk_layer_with},
     dag::Dag,
     occ::{AccountFetcher, FetchedAccount, OccConfig, capture_occ_with_retries},
-    sender::{ReliableSender, SendReport},
+    sender::{ReliableSender, SendReport, CuScope},
     serializer::{BuildTxCtx, build_v0_message},
-    fee::{FeeOracle, FeePlan},
+    fee::{FeeOracle},
 };
 use cpsr_types::UserIntent;
 use estimator::config::SafetyMargins;
@@ -69,7 +69,7 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     mixed_contended: u32,
 
-    /// Force a CU price (μLam/CU). If omitted, oracle uses 0 (no priority fee).
+    /// Force a CU price (μLam/CU). If omitted, oracle uses its default (usually non-zero floor).
     #[arg(long)]
     cu_price: Option<u64>,
 
@@ -89,6 +89,10 @@ struct Args {
     #[arg(long, default_value_t = true)]
     compare_baseline: bool,
 
+    /// Choose how the CU window is learned for P95: "global" or "per-layer"
+    #[arg(long, value_enum, default_value_t = CuScopeCli::Global)]
+    cu_scope: CuScopeCli,
+
     /// Write a JSON report here (optional)
     #[arg(long)]
     out_report: Option<PathBuf>,
@@ -96,6 +100,17 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CuScopeCli { Global, PerLayer }
+impl From<CuScopeCli> for CuScope {
+    fn from(v: CuScopeCli) -> Self {
+        match v {
+            CuScopeCli::Global => CuScope::Global,
+            CuScopeCli::PerLayer => CuScope::PerScope,
+        }
+    }
+}
 
 /// Bridge our OCC trait to the RPC client.
 struct RpcAccountFetcher { rpc: Arc<RpcClient>, commitment: CommitmentConfig }
@@ -225,7 +240,6 @@ fn main() -> Result<()> {
         // (2) Contended transfers: all write same dest → chained by DAG
         for i in 0..args.mixed_contended {
             let ix = system_instruction::transfer(&payer_pubkey, &dest, args.demo_lamports);
-            // vary priority a bit so one transfer joins layer 0 with memos
             let prio: u8 = match i % 3 { 0 => 7, 1 => 5, _ => 3 };
             v.push(UserIntent::new(payer_pubkey, ix, prio, None));
         }
@@ -257,10 +271,10 @@ fn main() -> Result<()> {
     let account_fetcher = RpcAccountFetcher { rpc: rpc.clone(), commitment: commitment.clone() };
     let fee_oracle: Box<dyn FeeOracle> = Box::new(bundler::fee::BasicFeeOracle {
         max_cu_limit: args.max_cu_limit.unwrap_or(1_400_000),
-        min_cu_price: args.cu_price.unwrap_or(0),
+        min_cu_price: args.cu_price.unwrap_or(100), // non-zero floor by default
         max_cu_price: 5_000,
     });
-    let sender = ReliableSender { rpc: rpc.clone(), fee_oracle };
+    let sender = ReliableSender::with_scope(rpc.clone(), fee_oracle, args.cu_scope.into());
 
     // --------- DAG & layers (for the report) ----------
     let dag = Dag::build(intents.clone());
@@ -274,12 +288,15 @@ fn main() -> Result<()> {
 
     // --------- ROLLUP path: chunk layer-by-layer ----------
     for layer in layers {
+        // Reset CU stats per layer if requested.
+        sender.start_scope();
+
         let groups = chunk_layer_with(&layer, &dag.nodes, &tx_budget, &alt_policy, &ChunkOracle)?;
         for node_ids in groups {
             let chunk_intents: Vec<UserIntent> =
                 node_ids.iter().map(|&nid| dag.nodes[nid as usize].clone()).collect();
 
-            // OCC capture (recorded for future; not directly used by the report)
+            // OCC capture
             let _snap = capture_occ_with_retries(&account_fetcher, &chunk_intents, &occ_cfg)?;
 
             let alts: AltResolution = alt_mgr.resolve_tables(chunk_intents.len());

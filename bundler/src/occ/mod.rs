@@ -343,7 +343,7 @@ mod tests {
 
     impl AccountFetcher for MockFetcher {
         fn fetch_many(&self, keys: &[Pubkey]) -> Result<HashMap<Pubkey, FetchedAccount>, OccError> {
-            if let Some(e) = &self.fail_with {
+            if let Some(ref e) = self.fail_with {
                 return Err(e.clone());
             }
             let mut out = HashMap::with_capacity(keys.len());

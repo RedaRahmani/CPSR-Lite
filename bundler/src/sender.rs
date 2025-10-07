@@ -1,5 +1,6 @@
 // bundler/src/sender.rs
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use solana_client::{
@@ -28,13 +29,64 @@ pub struct SendReport {
     pub total_fee_lamports: u64,            // base + priority (excludes rent, etc.)
 }
 
+/// Maintains a sliding window of recent used CU to compute P95.
+#[derive(Default)]
+struct CuStats {
+    window: VecDeque<u32>,
+    cap: usize, // max samples to keep
+}
+impl CuStats {
+    fn new(cap: usize) -> Self { Self { window: VecDeque::with_capacity(cap), cap } }
+    fn clear(&mut self) { self.window.clear(); }
+    fn record(&mut self, used: u32) {
+        if self.window.len() == self.cap { self.window.pop_front(); }
+        self.window.push_back(used);
+    }
+    fn p95(&self) -> Option<u32> {
+        if self.window.is_empty() { return None; }
+        let mut v: Vec<u32> = self.window.iter().copied().collect();
+        v.sort_unstable();
+        let n = v.len();
+        let idx = (((n as f64) * 0.95).ceil() as usize).saturating_sub(1).min(n - 1);
+        Some(v[idx])
+    }
+}
+
+/// How to scope the CU window when computing P95.
+#[derive(Clone, Copy, Debug)]
+pub enum CuScope {
+    /// Learn one window for the entire process (default).
+    Global,
+    /// Caller resets between scopes (e.g., per DAG layer).
+    PerScope,
+}
+
 pub struct ReliableSender {
     pub rpc: Arc<RpcClient>,
     pub fee_oracle: Box<dyn FeeOracle>,
+    stats: Mutex<CuStats>,
+    scope: CuScope,
 }
 
 impl ReliableSender {
-    /// Simulate -> tighten CU limit with safety -> rebuild -> (optionally) send.
+    /// Default: global P95 window (good for steady workloads).
+    pub fn new(rpc: Arc<RpcClient>, fee_oracle: Box<dyn FeeOracle>) -> Self {
+        Self { rpc, fee_oracle, stats: Mutex::new(CuStats::new(128)), scope: CuScope::Global }
+    }
+
+    /// Configure the CU scope policy.
+    pub fn with_scope(rpc: Arc<RpcClient>, fee_oracle: Box<dyn FeeOracle>, scope: CuScope) -> Self {
+        Self { rpc, fee_oracle, stats: Mutex::new(CuStats::new(128)), scope }
+    }
+
+    /// If scope == PerScope, call this at the start of each logical scope (e.g., each DAG layer).
+    pub fn start_scope(&self) {
+        if let CuScope::PerScope = self.scope {
+            if let Ok(mut s) = self.stats.lock() { s.clear(); }
+        }
+    }
+
+    /// Simulate -> tighten CU limit with P95+Safety -> rebuild -> (optionally) send.
     /// Returns a rich SendReport for cost accounting.
     pub fn simulate_build_and_send_with_report<FBuild>(
         &self,
@@ -45,10 +97,10 @@ impl ReliableSender {
     where
         FBuild: FnMut(FeePlan) -> Result<VersionedMessage>,
     {
-        // 1) Start with oracle suggestion (clamped)
+        // 1) Start with oracle suggestion (clamped).
         let plan0 = self.fee_oracle.clamp(self.fee_oracle.suggest());
 
-        // 2) Build & simulate to learn units
+        // 2) Build & simulate to learn units.
         let vmsg0 = build(plan0.clone())?;
         let tx0 = VersionedTransaction::try_new(vmsg0.clone(), signers)?;
         let sim = self.rpc.simulate_transaction_with_config(
@@ -64,31 +116,39 @@ impl ReliableSender {
         }
         let used = sim.value.units_consumed.unwrap_or(200_000) as u32;
 
-        // 3) Apply safety + cap, clamp with oracle again
-        let safe = apply_safety_with_cap(used, 10_000, 20, plan0.cu_limit as u32);
+        // 3) Update stats and compute P95 envelope.
+        {
+            let mut s = self.stats.lock().expect("cu stats mutex");
+            s.record(used);
+        }
+        let p95_used = self.stats.lock().unwrap().p95().unwrap_or(used);
+        let target_limit = p95_used.max(used); // conservative
+
+        // 4) Apply safety (+10k +20%, clamped to oracle’s max limit).
+        let safe = apply_safety_with_cap(target_limit, 10_000, 20, plan0.cu_limit as u32);
         let mut plan = FeePlan {
             cu_limit: safe.cu_with_safety as u64,
             cu_price_microlamports: plan0.cu_price_microlamports,
         };
         plan = self.fee_oracle.clamp(plan);
 
-        // 4) Rebuild with final plan
+        // 5) Rebuild with final plan.
         let vmsg = build(plan.clone())?;
 
-        // 5) Fee accounting
+        // 6) Fee accounting.
         let message_bytes = bincode::serialize(&vmsg)?.len();
         let required_signers = match &vmsg {
             VersionedMessage::Legacy(m) => m.header.num_required_signatures as usize,
             VersionedMessage::V0(m) => m.header.num_required_signatures as usize,
         };
-        // Base fee: 5000 lamports per signature (official docs)
+        // Base fee: 5000 lamports per signature (runtime constant).
         let base_fee_lamports = 5000u64 * (required_signers as u64);
         // Priority fee: limit * price (μLam) -> lamports
         let priority_fee_lamports = (plan.cu_limit.saturating_mul(plan.cu_price_microlamports)) / 1_000_000;
         let mut signature = None;
 
         if !dry_run {
-            // 6) Verify blockhash then send
+            // 7) Verify blockhash then send.
             let bh = match &vmsg {
                 VersionedMessage::Legacy(m) => m.recent_blockhash,
                 VersionedMessage::V0(m) => m.recent_blockhash,
