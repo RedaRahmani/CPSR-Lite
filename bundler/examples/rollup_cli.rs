@@ -1,5 +1,5 @@
 // bundler/examples/rollup_cli.rs
-use std::{fs, path::PathBuf, str::FromStr, time::Duration, sync::Arc};
+use std::{fs, path::PathBuf, str::FromStr, time::{Duration, Instant}, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -17,7 +17,7 @@ use bundler::{
     chunking::{AltPolicy, BasicOracle as ChunkOracle, TxBudget, chunk_layer_with},
     dag::Dag,
     occ::{AccountFetcher, FetchedAccount, OccConfig, capture_occ_with_retries},
-    sender::{ReliableSender, SendReport, CuScope},
+    sender::{ReliableSender, SendReport, CuScope, global_rpc_metrics_snapshot, track_get_latest_blockhash, track_is_blockhash_valid},
     serializer::{BuildTxCtx, build_v0_message},
     fee::{FeeOracle},
 };
@@ -160,6 +160,22 @@ struct DemoReport {
     baseline: Vec<TxCost>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct StageMetric {
+    name: String,
+    count: u64,
+    total_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TracingReport {
+    run_mode: String,
+    stages: Vec<StageMetric>,
+    rpc: bundler::sender::RpcMetrics,
+    mock_in_use: bool,
+    rpc_url: String,
+}
+
 fn parse_commitment(s: &str) -> CommitmentConfig {
     match s {
         "processed" => CommitmentConfig::processed(),
@@ -187,9 +203,12 @@ fn make_build_vmsg<'a>(
     commitment: solana_sdk::commitment_config::CommitmentConfig,
 ) -> impl FnMut(bundler::fee::FeePlan) -> anyhow::Result<solana_sdk::message::VersionedMessage> + 'a {
     move |plan: bundler::fee::FeePlan| {
-        // Refresh blockhash if needed
+        // Refresh blockhash if needed  
+        track_is_blockhash_valid();
         let still = rpc.is_blockhash_valid(bh, commitment.clone())?;
         if !still {
+            tracing::info!("Blockhash invalid, refreshing");
+            track_get_latest_blockhash();
             *bh = rpc.get_latest_blockhash()?;
         }
         let ctx = BuildTxCtx {
@@ -204,6 +223,14 @@ fn make_build_vmsg<'a>(
 }
 
 fn main() -> Result<()> {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
+
     let args = Args::parse();
 
     let payer = read_keypair_file(&args.payer)
@@ -214,6 +241,14 @@ fn main() -> Result<()> {
     let rpc = Arc::new(RpcClient::new_with_timeout_and_commitment(
         args.rpc.clone(), Duration::from_secs(25), commitment.clone(),
     ));
+
+    // Mock check: detect if using mock RPC
+    let mock_in_use = args.rpc.contains("mock") || std::env::var("SOLANA_RPC_MOCK").is_ok();
+    tracing::info!(
+        rpc_url = %args.rpc,
+        mock_in_use = mock_in_use,
+        "RPC client initialized"
+    );
 
     // --------- Intents ----------
     let intents: Vec<UserIntent> = if let Some(path) = args.intents.as_ref() {
@@ -277,29 +312,69 @@ fn main() -> Result<()> {
     let sender = ReliableSender::with_scope(rpc.clone(), fee_oracle, args.cu_scope.into());
 
     // --------- DAG & layers (for the report) ----------
-    let dag = Dag::build(intents.clone());
+    let dag_start = Instant::now();
+    let dag = {
+        let span = tracing::info_span!("dag.build", intents_total = intents.len());
+        let _enter = span.enter();
+        tracing::info!("Building DAG from {} intents", intents.len());
+        Dag::build(intents.clone())
+    };
+    let dag_duration = dag_start.elapsed();
+    tracing::info!("DAG build completed in {:?}", dag_duration);
+    
     let layers = dag.layers().context("topo layers")?;
     let layers_sizes: Vec<usize> = layers.iter().map(|l| l.len()).collect();
+    tracing::info!("DAG has {} layers: {:?}", layers.len(), layers_sizes);
 
     // Grab a recent blockhash up front
+    tracing::info!("Fetching initial blockhash");
+    track_get_latest_blockhash();
     let mut blockhash = rpc.get_latest_blockhash()?;
 
     let mut rollup_reports: Vec<TxCost> = Vec::new();
 
     // --------- ROLLUP path: chunk layer-by-layer ----------
-    for layer in layers {
+    tracing::info!("Starting rollup processing with {} layers", layers.len());
+    for (layer_index, layer) in layers.iter().enumerate() {
+        let layer_start = Instant::now();
+        let span = tracing::info_span!("chunking.layer", layer_index = layer_index, layer_size = layer.len());
+        let _enter = span.enter();
+        
+        tracing::info!("Processing layer {} with {} intents", layer_index, layer.len());
+        
         // Reset CU stats per layer if requested.
         sender.start_scope();
 
+        let chunking_start = Instant::now();
         let groups = chunk_layer_with(&layer, &dag.nodes, &tx_budget, &alt_policy, &ChunkOracle)?;
+        let chunking_duration = chunking_start.elapsed();
+        tracing::info!("Chunking layer {} took {:?}, produced {} chunks", layer_index, chunking_duration, groups.len());
+        
         for node_ids in groups {
+            let chunk_span = tracing::info_span!("chunking.chunk", node_count = node_ids.len());
+            let _chunk_enter = chunk_span.enter();
+            
             let chunk_intents: Vec<UserIntent> =
                 node_ids.iter().map(|&nid| dag.nodes[nid as usize].clone()).collect();
 
             // OCC capture
+            let occ_start = Instant::now();
+            let occ_span = tracing::info_span!("occ.capture", key_count = chunk_intents.len());
+            let _occ_enter = occ_span.enter();
             let _snap = capture_occ_with_retries(&account_fetcher, &chunk_intents, &occ_cfg)?;
+            let occ_duration = occ_start.elapsed();
+            tracing::info!("OCC capture took {:?} for {} keys", occ_duration, chunk_intents.len());
+            drop(_occ_enter);
 
+            // ALT resolve
+            let alt_start = Instant::now();
+            let alt_span = tracing::info_span!("alt.resolve", requested_count = chunk_intents.len());
+            let _alt_enter = alt_span.enter();
             let alts: AltResolution = alt_mgr.resolve_tables(chunk_intents.len());
+            let alt_duration = alt_start.elapsed();
+            tracing::info!("ALT resolve took {:?} for {} intents, got {} tables", alt_duration, chunk_intents.len(), alts.tables.len());
+            drop(_alt_enter);
+            
             let mut build = make_build_vmsg(
                 payer_pubkey,
                 &mut blockhash,
@@ -310,7 +385,23 @@ fn main() -> Result<()> {
                 commitment.clone(),
             );
 
+            // Sender simulate + send
+            let sender_start = Instant::now();
+            let sender_span = tracing::info_span!("sender.simulate");
+            let _sender_enter = sender_span.enter();
             let rep: SendReport = sender.simulate_build_and_send_with_report(&mut build, &[&payer], args.dry_run)?;
+            let sender_duration = sender_start.elapsed();
+            
+            let send_action = if args.dry_run { "dry_run" } else { "sent" };
+            tracing::info!(
+                "Sender operation took {:?}, used_cu = {}, final_cu_limit = {}, final_cu_price = {}, action = {}",
+                sender_duration, rep.used_cu, rep.final_plan.cu_limit, rep.final_plan.cu_price_microlamports, send_action
+            );
+            
+            if let Some(sig) = &rep.signature {
+                tracing::info!(sig = %sig, "Transaction sent");
+            }
+            
             rollup_reports.push(TxCost {
                 signature: rep.signature.map(|s| s.to_string()),
                 used_cu: rep.used_cu,
@@ -323,13 +414,22 @@ fn main() -> Result<()> {
                 total_fee_lamports: rep.total_fee_lamports,
             });
         }
+        
+        let layer_duration = layer_start.elapsed();
+        tracing::info!("Layer {} completed in {:?}", layer_index, layer_duration);
+        
+        tracing::info!("Refreshing blockhash after layer {}", layer_index);
+        track_get_latest_blockhash();
         blockhash = rpc.get_latest_blockhash()?;
     }
 
     // --------- BASELINE path: one tx per intent ----------
     let mut baseline: Vec<TxCost> = Vec::new();
     if args.compare_baseline {
-        for ui in intents.iter().cloned() {
+        tracing::info!("Starting baseline processing for {} intents", intents.len());
+        let baseline_start = Instant::now();
+        
+        for (i, ui) in intents.iter().cloned().enumerate() {
             let mut build = make_build_vmsg(
                 payer_pubkey,
                 &mut blockhash,
@@ -351,7 +451,13 @@ fn main() -> Result<()> {
                 priority_fee_lamports: rep.priority_fee_lamports,
                 total_fee_lamports: rep.total_fee_lamports,
             });
+            if (i + 1) % 10 == 0 || i == intents.len() - 1 {
+                tracing::info!("Baseline progress: {}/{}", i + 1, intents.len());
+            }
         }
+        
+        let baseline_duration = baseline_start.elapsed();
+        tracing::info!("Baseline processing completed in {:?}", baseline_duration);
     }
 
     let rollup_total: u64 = rollup_reports.iter().map(|x| x.total_fee_lamports).sum();
@@ -370,12 +476,44 @@ fn main() -> Result<()> {
         baseline_total_fee: baseline_total,
         absolute_savings_lamports: savings_abs,
         savings_percent: (savings_pct * 100.0).round() / 100.0,
-        rollup_txs: rollup_reports,
-        baseline,
+        rollup_txs: rollup_reports.clone(),
+        baseline: baseline.clone(),
     };
 
+    // Collect final metrics
+    let final_rpc_metrics = global_rpc_metrics_snapshot();
+    
+    // Create tracing report
+    let run_mode = match args.cu_scope {
+        CuScopeCli::Global => "default".to_string(),
+        CuScopeCli::PerLayer => "per-layer".to_string(),
+    };
+    
+    let tracing_report = TracingReport {
+        run_mode,
+        stages: vec![
+            StageMetric {
+                name: "dag.build".to_string(),
+                count: 1,
+                total_ms: dag_duration.as_millis() as u64,
+            },
+            StageMetric {
+                name: "rollup.execution".to_string(),
+                count: rollup_reports.len() as u64,
+                total_ms: 0, // We'd need to aggregate per-chunk timings
+            },
+        ],
+        rpc: final_rpc_metrics.clone(),
+        mock_in_use,
+        rpc_url: args.rpc.clone(),
+    };
+    
+    // Print machine-readable JSON first
+    println!("=== TRACING REPORT JSON ===");
+    println!("{}", serde_json::to_string_pretty(&tracing_report)?);
+    
     // Pretty print + optional JSON
-    println!("=== CPSR-Lite Demo Report ===");
+    println!("\n=== CPSR-Lite Demo Report ===");
     println!("intents: {}", report.intents);
     println!("dag layers: {:?}", report.dag_layers);
     println!("rollup: {} chunk txs, total fee {} lamports", report.rollup_chunks, report.rollup_total_fee);
@@ -383,8 +521,23 @@ fn main() -> Result<()> {
         println!("baseline: {} txs, total fee {} lamports", report.baseline_txs, report.baseline_total_fee);
         println!("savings: {} lamports ({:.2}%)", report.absolute_savings_lamports, report.savings_percent);
     }
+    
+    // Print RPC metrics table
+    println!("\n=== RPC METRICS ===");
+    println!("| Metric                     | Count |");
+    println!("|----------------------------|-------|");
+    println!("| simulateTransaction        | {:5} |", final_rpc_metrics.simulate);
+    println!("| isBlockhashValid           | {:5} |", final_rpc_metrics.is_blockhash_valid);
+    println!("| getLatestBlockhash         | {:5} |", final_rpc_metrics.get_latest_blockhash);
+    println!("| getRecentPrioritizationFees| {:5} |", final_rpc_metrics.get_recent_prioritization_fees);
+    println!("| sendTransaction            | {:5} |", final_rpc_metrics.send_transaction);
+    
     if let Some(path) = args.out_report {
-        let json = serde_json::to_string_pretty(&report)?;
+        let combined_report = serde_json::json!({
+            "demo": report,
+            "tracing": tracing_report
+        });
+        let json = serde_json::to_string_pretty(&combined_report)?;
         fs::write(&path, json)?;
         println!("wrote JSON report to {:?}", path);
     }

@@ -1,6 +1,8 @@
 // bundler/src/sender.rs
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use solana_client::{
@@ -16,6 +18,45 @@ use solana_sdk::{
 };
 use estimator::cost::apply_safety_with_cap;
 use crate::fee::{FeeOracle, FeePlan};
+
+// Global RPC metrics counters
+static RPC_SIMULATE_COUNT: AtomicU64 = AtomicU64::new(0);
+static RPC_IS_BLOCKHASH_VALID_COUNT: AtomicU64 = AtomicU64::new(0);
+static RPC_GET_LATEST_BLOCKHASH_COUNT: AtomicU64 = AtomicU64::new(0);
+static RPC_SEND_TRANSACTION_COUNT: AtomicU64 = AtomicU64::new(0);
+static RPC_GET_RECENT_FEES_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RpcMetrics {
+    pub simulate: u64,
+    pub is_blockhash_valid: u64,
+    pub get_latest_blockhash: u64,
+    pub send_transaction: u64,
+    pub get_recent_prioritization_fees: u64,
+}
+
+pub fn global_rpc_metrics_snapshot() -> RpcMetrics {
+    RpcMetrics {
+        simulate: RPC_SIMULATE_COUNT.load(Ordering::Relaxed),
+        is_blockhash_valid: RPC_IS_BLOCKHASH_VALID_COUNT.load(Ordering::Relaxed),
+        get_latest_blockhash: RPC_GET_LATEST_BLOCKHASH_COUNT.load(Ordering::Relaxed),
+        send_transaction: RPC_SEND_TRANSACTION_COUNT.load(Ordering::Relaxed),
+        get_recent_prioritization_fees: RPC_GET_RECENT_FEES_COUNT.load(Ordering::Relaxed),
+    }
+}
+
+// Helper functions to track external RPC calls
+pub fn track_get_latest_blockhash() {
+    RPC_GET_LATEST_BLOCKHASH_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn track_is_blockhash_valid() {
+    RPC_IS_BLOCKHASH_VALID_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn track_get_recent_prioritization_fees() {
+    RPC_GET_RECENT_FEES_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Clone, Debug)]
 pub struct SendReport {
@@ -103,6 +144,8 @@ impl ReliableSender {
         // 2) Build & simulate to learn units.
         let vmsg0 = build(plan0.clone())?;
         let tx0 = VersionedTransaction::try_new(vmsg0.clone(), signers)?;
+        
+        let sim_start = Instant::now();
         let sim = self.rpc.simulate_transaction_with_config(
             &tx0,
             RpcSimulateTransactionConfig {
@@ -111,6 +154,9 @@ impl ReliableSender {
                 ..Default::default()
             },
         )?;
+        let sim_duration = sim_start.elapsed();
+        RPC_SIMULATE_COUNT.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("simulate_transaction took {:?}", sim_duration);
         if let Some(err) = sim.value.err {
             return Err(anyhow!("simulation error: {:?}", err));
         }
@@ -153,11 +199,19 @@ impl ReliableSender {
                 VersionedMessage::Legacy(m) => m.recent_blockhash,
                 VersionedMessage::V0(m) => m.recent_blockhash,
             };
+            
+            let blockhash_start = Instant::now();
             let ok = self.rpc.is_blockhash_valid(&bh, CommitmentConfig::processed())?;
+            let blockhash_duration = blockhash_start.elapsed();
+            RPC_IS_BLOCKHASH_VALID_COUNT.fetch_add(1, Ordering::Relaxed);
+            tracing::info!("is_blockhash_valid took {:?}", blockhash_duration);
+            
             if !ok {
                 return Err(anyhow!("stale blockhash; rebuild required"));
             }
             let tx_final = VersionedTransaction::try_new(vmsg, signers)?;
+            
+            let send_start = Instant::now();
             let sig = self.rpc.send_transaction_with_config(
                 &tx_final,
                 RpcSendTransactionConfig {
@@ -166,6 +220,9 @@ impl ReliableSender {
                     ..Default::default()
                 },
             )?;
+            let send_duration = send_start.elapsed();
+            RPC_SEND_TRANSACTION_COUNT.fetch_add(1, Ordering::Relaxed);
+            tracing::info!("send_transaction took {:?}", send_duration);
             signature = Some(sig);
         }
 

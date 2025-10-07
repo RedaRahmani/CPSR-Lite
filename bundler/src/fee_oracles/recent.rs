@@ -1,4 +1,4 @@
-//! A percentile + EMA fee oracle built on `getRecentPrioritizationFees`.
+//! A percentile + EMA fee orause crate::fee::{FeeOracle, FeePlan};t on `getRecentPrioritizationFees`.
 //!
 //! Policy
 //! - Take P75 of recent priority-fee samples across probe accounts (fallback P90 if not enough data).
@@ -28,6 +28,13 @@ use solana_client::rpc_response::RpcPrioritizationFee;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::fee::{FeeOracle, FeePlan};
+
+// Global counter for getRecentPrioritizationFees calls
+static RPC_GET_RECENT_FEES_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn get_recent_fees_count() -> u64 {
+    RPC_GET_RECENT_FEES_COUNT.load(AtomicOrdering::Relaxed)
+}
 
 #[derive(Clone)]
 pub struct RecentFeesOracle {
@@ -68,6 +75,7 @@ impl RecentFeesOracle {
 
     fn fetch_fees(&self) -> Vec<u64> {
         // If probe_accounts is empty, RPC returns recent fees anyway.
+        crate::sender::track_get_recent_prioritization_fees();
         match self
             .rpc
             .get_recent_prioritization_fees(&self.probe_accounts)
