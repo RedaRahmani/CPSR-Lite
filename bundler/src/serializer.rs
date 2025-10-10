@@ -23,6 +23,26 @@ pub struct BuildTxCtx {
     pub safety: SafetyMargins,
 }
 
+/// Compute Solana compact "shortvec" length for a u16-like count (7 bits per byte).
+#[inline]
+pub fn shortvec_len(n: usize) -> usize {
+    let mut x = n;
+    let mut bytes = 0;
+    loop {
+        bytes += 1;
+        if x < 0x80 { break; }
+        x >>= 7;
+    }
+    bytes
+}
+
+/// Number of bytes occupied by the signatures section in a serialized Transaction:
+///   shortvec(len(signatures)) + len(signatures) * 64
+#[inline]
+pub fn signatures_section_len(required_signers: usize) -> usize {
+    shortvec_len(required_signers) + required_signers * 64
+}
+
 /// Build a v0 *message* (not a signed transaction). Caller will sign later.
 pub fn build_v0_message(ctx: &BuildTxCtx, intents: &[UserIntent]) -> Result<VersionedMessage> {
     if intents.is_empty() { return Err(anyhow!("no intents")); }
@@ -38,10 +58,11 @@ pub fn build_v0_message(ctx: &BuildTxCtx, intents: &[UserIntent]) -> Result<Vers
     let msg = MessageV0::try_compile(&ctx.payer, &ixs, &ctx.alts.tables, ctx.blockhash)?;
     let vmsg = VersionedMessage::V0(msg.clone());
 
-    // 3) Enforce packet-size budget: signatures (64B each) + message ≤ budget.
+    // 3) Enforce packet-size budget: signatures (64B each + shortvec prefix) + message ≤ budget.
     let message_bytes = bincode::serialize(&vmsg)?.len();
     let required_signers = msg.header.num_required_signatures as usize;
     let max_msg = ctx.safety.max_message_bytes_with_signers(required_signers);
+
     if message_bytes > max_msg {
         return Err(anyhow!(
             "message {}B exceeds budget {}B (reserved for {} signers)",
@@ -66,6 +87,23 @@ mod tests {
             data: vec![1,2,3],
         };
         UserIntent::new(Pubkey::new_unique(), ix, 0, None)
+    }
+
+    #[test]
+    fn shortvec_len_works() {
+        assert_eq!(shortvec_len(0), 1);
+        assert_eq!(shortvec_len(127), 1);
+        assert_eq!(shortvec_len(128), 2);
+        assert_eq!(shortvec_len(16_383), 2);
+        assert_eq!(shortvec_len(16_384), 3); // upper bound for u16 space
+    }
+
+    #[test]
+    fn signatures_section_len_works() {
+        // 1 signer: 1-byte shortvec + 64 bytes
+        assert_eq!(signatures_section_len(1), 1 + 64);
+        // 128 signers: 2-byte shortvec + 128*64
+        assert_eq!(signatures_section_len(128), 2 + (128 * 64));
     }
 
     #[test]

@@ -107,17 +107,38 @@ pub struct ReliableSender {
     pub fee_oracle: Box<dyn FeeOracle>,
     stats: Mutex<CuStats>,
     scope: CuScope,
+    /// If true (default), explicitly pre-check blockhash via isBlockhashValid.
+    /// If false, rely on preflight only (faster).
+    pub pre_check_blockhash: bool,
 }
 
 impl ReliableSender {
     /// Default: global P95 window (good for steady workloads).
     pub fn new(rpc: Arc<RpcClient>, fee_oracle: Box<dyn FeeOracle>) -> Self {
-        Self { rpc, fee_oracle, stats: Mutex::new(CuStats::new(128)), scope: CuScope::Global }
+        Self {
+            rpc,
+            fee_oracle,
+            stats: Mutex::new(CuStats::new(128)),
+            scope: CuScope::Global,
+            pre_check_blockhash: true,
+        }
     }
 
     /// Configure the CU scope policy.
     pub fn with_scope(rpc: Arc<RpcClient>, fee_oracle: Box<dyn FeeOracle>, scope: CuScope) -> Self {
-        Self { rpc, fee_oracle, stats: Mutex::new(CuStats::new(128)), scope }
+        Self {
+            rpc,
+            fee_oracle,
+            stats: Mutex::new(CuStats::new(128)),
+            scope,
+            pre_check_blockhash: true,
+        }
+    }
+
+    /// Enable fast send: skip explicit isBlockhashValid (preflight still runs).
+    pub fn with_fast_send(mut self) -> Self {
+        self.pre_check_blockhash = false;
+        self
     }
 
     /// If scope == PerScope, call this at the start of each logical scope (e.g., each DAG layer).
@@ -140,6 +161,13 @@ impl ReliableSender {
     {
         // 1) Start with oracle suggestion (clamped).
         let plan0 = self.fee_oracle.clamp(self.fee_oracle.suggest());
+        tracing::info!(
+            target: "fee",
+            init_cu_limit = plan0.cu_limit,
+            init_cu_price = plan0.cu_price_microlamports,
+            "initial fee plan from oracle: cu_limit={}, cu_price={} μLam/CU",
+            plan0.cu_limit, plan0.cu_price_microlamports
+        );
 
         // 2) Build & simulate to learn units.
         let vmsg0 = build(plan0.clone())?;
@@ -193,22 +221,35 @@ impl ReliableSender {
         let priority_fee_lamports = (plan.cu_limit.saturating_mul(plan.cu_price_microlamports)) / 1_000_000;
         let mut signature = None;
 
+        tracing::info!(
+            target: "fee",
+            final_cu_limit = plan.cu_limit,
+            final_cu_price = plan.cu_price_microlamports,
+            used_cu = used,
+            p95_used = p95_used,
+            "final fee plan after simulate+tighten: cu_limit={} (used={} p95={}), cu_price={} μLam/CU",
+            plan.cu_limit, used, p95_used, plan.cu_price_microlamports
+        );
+
         if !dry_run {
-            // 7) Verify blockhash then send.
-            let bh = match &vmsg {
-                VersionedMessage::Legacy(m) => m.recent_blockhash,
-                VersionedMessage::V0(m) => m.recent_blockhash,
-            };
-            
-            let blockhash_start = Instant::now();
-            let ok = self.rpc.is_blockhash_valid(&bh, CommitmentConfig::processed())?;
-            let blockhash_duration = blockhash_start.elapsed();
-            RPC_IS_BLOCKHASH_VALID_COUNT.fetch_add(1, Ordering::Relaxed);
-            tracing::info!("is_blockhash_valid took {:?}", blockhash_duration);
-            
-            if !ok {
-                return Err(anyhow!("stale blockhash; rebuild required"));
+            // Optional explicit pre-check. Safe to skip because preflight checks it anyway.
+            if self.pre_check_blockhash {
+                let bh = match &vmsg {
+                    VersionedMessage::Legacy(m) => m.recent_blockhash,
+                    VersionedMessage::V0(m) => m.recent_blockhash,
+                };
+                
+                let blockhash_start = Instant::now();
+                let ok = self.rpc.is_blockhash_valid(&bh, CommitmentConfig::processed())?;
+                let blockhash_duration = blockhash_start.elapsed();
+                RPC_IS_BLOCKHASH_VALID_COUNT.fetch_add(1, Ordering::Relaxed);
+                tracing::info!("is_blockhash_valid took {:?}", blockhash_duration);
+                
+                if !ok {
+                    return Err(anyhow!("stale blockhash; rebuild required"));
+                }
             }
+
             let tx_final = VersionedTransaction::try_new(vmsg, signers)?;
             
             let send_start = Instant::now();

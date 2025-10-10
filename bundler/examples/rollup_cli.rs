@@ -16,14 +16,18 @@ use bundler::{
     alt::{AltManager, AltResolution, NoAltManager},
     chunking::{AltPolicy, BasicOracle as ChunkOracle, TxBudget, chunk_layer_with},
     dag::Dag,
-    occ::{AccountFetcher, FetchedAccount, OccConfig, capture_occ_with_retries},
+    occ::{FetchedAccount, OccConfig, capture_occ_with_retries},
     sender::{ReliableSender, SendReport, CuScope, global_rpc_metrics_snapshot, track_get_latest_blockhash, track_is_blockhash_valid},
-    serializer::{BuildTxCtx, build_v0_message},
-    fee::{FeeOracle},
+    serializer::signatures_section_len,
+    fee::FeeOracle,
 };
+
 use cpsr_types::UserIntent;
 use estimator::config::SafetyMargins;
 use serde::Serialize;
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FeeOracleCli { Basic, Recent }
 
 /// ------- CLI args -------
 #[derive(Parser, Debug)]
@@ -93,6 +97,38 @@ struct Args {
     #[arg(long, value_enum, default_value_t = CuScopeCli::Global)]
     cu_scope: CuScopeCli,
 
+    /// Choose the fee oracle: "basic" (default) or "recent" (percentile + EMA)
+    #[arg(long, value_enum, default_value_t = FeeOracleCli::Basic)]
+    fee_oracle: FeeOracleCli,
+
+    /// When --fee-oracle recent: primary percentile (0..1, default 0.75)
+    #[arg(long)]
+    fee_pctile: Option<f64>,
+
+    /// When --fee-oracle recent: EMA alpha (0..1, default 0.20)
+    #[arg(long)]
+    fee_alpha: Option<f64>,
+
+    /// When --fee-oracle recent: hysteresis in bps (e.g., 300 = 3%)
+    #[arg(long)]
+    fee_hysteresis_bps: Option<u64>,
+
+    /// Override min cu price μLam/CU (floor)
+    #[arg(long)]
+    min_cu_price: Option<u64>,
+
+    /// Override max cu price μLam/CU (ceiling)
+    #[arg(long)]
+    max_cu_price: Option<u64>,
+
+    /// Optional: probe up to 128 account addresses for recent fee sampling
+    #[arg(long)]
+    probe_accounts: Option<String>, // comma-separated base58 pubkeys
+
+    /// Faster sends: skip explicit isBlockhashValid (preflight still runs).
+    #[arg(long, default_value_t = false)]
+    fast_send: bool,
+
     /// Write a JSON report here (optional)
     #[arg(long)]
     out_report: Option<PathBuf>,
@@ -114,7 +150,7 @@ impl From<CuScopeCli> for CuScope {
 
 /// Bridge our OCC trait to the RPC client.
 struct RpcAccountFetcher { rpc: Arc<RpcClient>, commitment: CommitmentConfig }
-impl AccountFetcher for RpcAccountFetcher {
+impl bundler::occ::AccountFetcher for RpcAccountFetcher {
     fn fetch_many(&self, keys: &[Pubkey]) -> Result<std::collections::HashMap<Pubkey, FetchedAccount>, bundler::occ::OccError> {
         use bundler::occ::OccError;
         let resp = self.rpc
@@ -141,6 +177,12 @@ struct TxCost {
     cu_price_micro_lamports: u64,
     message_bytes: usize,
     required_signers: usize,
+    /// serialized packet size (signatures shortvec + signatures*64 + message)
+    packet_bytes: usize,
+    /// max allowed packet size inferred from guard budgeting (~1232B total)
+    max_packet_bytes: usize,
+    /// whether the 1232-byte guard passed
+    packet_guard_pass: bool,
     base_fee_lamports: u64,
     priority_fee_lamports: u64,
     total_fee_lamports: u64,
@@ -193,37 +235,57 @@ fn memo_ix(text: &str) -> solana_sdk::instruction::Instruction {
 }
 
 // Helper to build a VersionedMessage for a set of intents
+// fn make_build_vmsg<'a>(
+//     payer_pk: solana_sdk::pubkey::Pubkey,
+//     bh: &'a mut solana_sdk::hash::Hash,
+//     alts: bundler::alt::AltResolution,
+//     chunk_intents: Vec<cpsr_types::UserIntent>,
+//     safety_cfg: estimator::config::SafetyMargins,
+//     rpc: std::sync::Arc<solana_client::rpc_client::RpcClient>,
+//     commitment: solana_sdk::commitment_config::CommitmentConfig,
+// ) -> impl FnMut(bundler::fee::FeePlan) -> anyhow::Result<solana_sdk::message::VersionedMessage> + 'a {
+//     move |plan: bundler::fee::FeePlan| {
+//         // Refresh blockhash if needed
+//         track_is_blockhash_valid();
+//         let still = rpc.is_blockhash_valid(bh, commitment.clone())?;
+//         if !still {
+//             tracing::info!("Blockhash invalid, refreshing");
+//             track_get_latest_blockhash();
+//             *bh = rpc.get_latest_blockhash()?;
+//         }
+//         let ctx = bundler::serializer::BuildTxCtx {
+//             payer: payer_pk,
+//             blockhash: *bh,
+//             fee: plan,
+//             alts: alts.clone(),
+//             safety: safety_cfg.clone(),
+//         };
+//         bundler::serializer::build_v0_message(&ctx, &chunk_intents)
+//     }
+// }
 fn make_build_vmsg<'a>(
     payer_pk: solana_sdk::pubkey::Pubkey,
     bh: &'a mut solana_sdk::hash::Hash,
     alts: bundler::alt::AltResolution,
     chunk_intents: Vec<cpsr_types::UserIntent>,
     safety_cfg: estimator::config::SafetyMargins,
-    rpc: std::sync::Arc<solana_client::rpc_client::RpcClient>,
-    commitment: solana_sdk::commitment_config::CommitmentConfig,
+    _rpc: std::sync::Arc<solana_client::rpc_client::RpcClient>,
+    _commitment: solana_sdk::commitment_config::CommitmentConfig,
 ) -> impl FnMut(bundler::fee::FeePlan) -> anyhow::Result<solana_sdk::message::VersionedMessage> + 'a {
     move |plan: bundler::fee::FeePlan| {
-        // Refresh blockhash if needed  
-        track_is_blockhash_valid();
-        let still = rpc.is_blockhash_valid(bh, commitment.clone())?;
-        if !still {
-            tracing::info!("Blockhash invalid, refreshing");
-            track_get_latest_blockhash();
-            *bh = rpc.get_latest_blockhash()?;
-        }
-        let ctx = BuildTxCtx {
+        // No is_blockhash_valid probe here; we trust the caller to refresh *bh when appropriate.
+        let ctx = bundler::serializer::BuildTxCtx {
             payer: payer_pk,
             blockhash: *bh,
             fee: plan,
             alts: alts.clone(),
             safety: safety_cfg.clone(),
         };
-        build_v0_message(&ctx, &chunk_intents)
+        bundler::serializer::build_v0_message(&ctx, &chunk_intents)
     }
 }
 
 fn main() -> Result<()> {
-    // Initialize tracing subscriber
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -242,20 +304,15 @@ fn main() -> Result<()> {
         args.rpc.clone(), Duration::from_secs(25), commitment.clone(),
     ));
 
-    // Mock check: detect if using mock RPC
+    // Mock check
     let mock_in_use = args.rpc.contains("mock") || std::env::var("SOLANA_RPC_MOCK").is_ok();
-    tracing::info!(
-        rpc_url = %args.rpc,
-        mock_in_use = mock_in_use,
-        "RPC client initialized"
-    );
+    tracing::info!(rpc_url = %args.rpc, mock_in_use = mock_in_use, "RPC client initialized");
 
     // --------- Intents ----------
     let intents: Vec<UserIntent> = if let Some(path) = args.intents.as_ref() {
         let data = fs::read_to_string(path).context("reading intents file")?;
         let parsed: Vec<UserIntent> = serde_json::from_str(&data).context("parsing intents JSON")?;
         parsed.into_iter().map(|ui| ui.normalized()).collect()
-
     } else if args.demo_mixed {
         // Mixed workload: independent memos + contended transfers (same dest)
         let to_str = args.demo_conflicting_to.as_ref()
@@ -264,32 +321,23 @@ fn main() -> Result<()> {
             .map_err(|_| anyhow!("--demo-conflicting-to must be a valid pubkey"))?;
 
         let mut v = Vec::new();
-
-        // (1) Independent memos → zero account metas → no conflicts
         for i in 0..args.mixed_memos {
             let ix = memo_ix(&format!("CPSR demo memo #{i}"));
-            // higher priority so they appear early; still no conflicts
             v.push(UserIntent::new(payer_pubkey, ix, 9, None));
         }
-
-        // (2) Contended transfers: all write same dest → chained by DAG
         for i in 0..args.mixed_contended {
             let ix = system_instruction::transfer(&payer_pubkey, &dest, args.demo_lamports);
             let prio: u8 = match i % 3 { 0 => 7, 1 => 5, _ => 3 };
             v.push(UserIntent::new(payer_pubkey, ix, prio, None));
         }
-
         v
-
     } else if let Some(to_str) = &args.demo_conflicting_to {
-        // All transfers contend on one dest (good to show serialization)
         let dest = Pubkey::from_str(to_str)
             .map_err(|_| anyhow!("--demo-conflicting-to must be a valid pubkey"))?;
         (0..args.demo_count).map(|_| {
             let ix = system_instruction::transfer(&payer_pubkey, &dest, args.demo_lamports);
             UserIntent::new(payer_pubkey, ix, 0, None)
         }).collect()
-
     } else {
         return Err(anyhow!("Provide either --intents PATH, --demo-mixed (with --demo-conflicting-to), or --demo-conflicting-to PUBKEY"));
     };
@@ -304,14 +352,47 @@ fn main() -> Result<()> {
     // --------- Deps ----------
     let alt_mgr: Box<dyn AltManager> = Box::new(NoAltManager);
     let account_fetcher = RpcAccountFetcher { rpc: rpc.clone(), commitment: commitment.clone() };
-    let fee_oracle: Box<dyn FeeOracle> = Box::new(bundler::fee::BasicFeeOracle {
-        max_cu_limit: args.max_cu_limit.unwrap_or(1_400_000),
-        min_cu_price: args.cu_price.unwrap_or(100), // non-zero floor by default
-        max_cu_price: 5_000,
-    });
-    let sender = ReliableSender::with_scope(rpc.clone(), fee_oracle, args.cu_scope.into());
 
-    // --------- DAG & layers (for the report) ----------
+    // Choose fee oracle
+    let fee_oracle: Box<dyn FeeOracle> = match args.fee_oracle {
+        FeeOracleCli::Basic => {
+            Box::new(bundler::fee::BasicFeeOracle {
+                max_cu_limit: args.max_cu_limit.unwrap_or(1_400_000),
+                min_cu_price: args.min_cu_price.or(args.cu_price).unwrap_or(100),
+                max_cu_price: args.max_cu_price.unwrap_or(5_000),
+            })
+        }
+        FeeOracleCli::Recent => {
+            use bundler::fee_oracles::recent::RecentFeesOracle;
+
+            // Parse optional probe accounts
+            let probes: Vec<Pubkey> = args.probe_accounts
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| Pubkey::from_str(s.trim()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| anyhow!("invalid --probe-accounts list"))?;
+
+            let mut o = RecentFeesOracle::new(rpc.clone(), probes);
+            if let Some(v) = args.max_cu_limit { o.max_cu_limit = v; }
+            if let Some(v) = args.min_cu_price.or(args.cu_price) { o.min_cu_price = v; }
+            if let Some(v) = args.max_cu_price { o.max_cu_price = v; }
+            if let Some(v) = args.fee_pctile { o.p_primary = v; }
+            if let Some(v) = args.fee_alpha { o.ema_alpha = v; }
+            if let Some(v) = args.fee_hysteresis_bps { o.hysteresis_bps = v; }
+            Box::new(o)
+        }
+    };
+
+    // Build sender and apply fast-send if requested
+    let mut sender = ReliableSender::with_scope(rpc.clone(), fee_oracle, args.cu_scope.into());
+    if args.fast_send {
+        sender = sender.with_fast_send();
+    }
+
+    // --------- DAG & layers ----------
     let dag_start = Instant::now();
     let dag = {
         let span = tracing::info_span!("dag.build", intents_total = intents.len());
@@ -333,7 +414,7 @@ fn main() -> Result<()> {
 
     let mut rollup_reports: Vec<TxCost> = Vec::new();
 
-    // --------- ROLLUP path: chunk layer-by-layer ----------
+    // --------- ROLLUP path ----------
     tracing::info!("Starting rollup processing with {} layers", layers.len());
     for (layer_index, layer) in layers.iter().enumerate() {
         let layer_start = Instant::now();
@@ -341,8 +422,6 @@ fn main() -> Result<()> {
         let _enter = span.enter();
         
         tracing::info!("Processing layer {} with {} intents", layer_index, layer.len());
-        
-        // Reset CU stats per layer if requested.
         sender.start_scope();
 
         let chunking_start = Instant::now();
@@ -391,7 +470,18 @@ fn main() -> Result<()> {
             let _sender_enter = sender_span.enter();
             let rep: SendReport = sender.simulate_build_and_send_with_report(&mut build, &[&payer], args.dry_run)?;
             let sender_duration = sender_start.elapsed();
-            
+
+            // Packet/guard logging
+            let sig_section = signatures_section_len(rep.required_signers);
+            let packet_bytes = rep.message_bytes + sig_section;
+            let max_msg_budget = safety.max_message_bytes_with_signers(rep.required_signers);
+            let max_packet_bytes = max_msg_budget + sig_section;
+            let guard_pass = rep.message_bytes <= max_msg_budget;
+            tracing::info!(
+                "Packet size: {}/{} bytes (signers={}, sig_section={}, message={}), guard_pass={}",
+                packet_bytes, max_packet_bytes, rep.required_signers, sig_section, rep.message_bytes, guard_pass
+            );
+
             let send_action = if args.dry_run { "dry_run" } else { "sent" };
             tracing::info!(
                 "Sender operation took {:?}, used_cu = {}, final_cu_limit = {}, final_cu_price = {}, action = {}",
@@ -409,6 +499,9 @@ fn main() -> Result<()> {
                 cu_price_micro_lamports: rep.final_plan.cu_price_microlamports,
                 message_bytes: rep.message_bytes,
                 required_signers: rep.required_signers,
+                packet_bytes,
+                max_packet_bytes,
+                packet_guard_pass: guard_pass,
                 base_fee_lamports: rep.base_fee_lamports,
                 priority_fee_lamports: rep.priority_fee_lamports,
                 total_fee_lamports: rep.total_fee_lamports,
@@ -423,23 +516,34 @@ fn main() -> Result<()> {
         blockhash = rpc.get_latest_blockhash()?;
     }
 
-    // --------- BASELINE path: one tx per intent ----------
+    // --------- BASELINE path ----------
     let mut baseline: Vec<TxCost> = Vec::new();
     if args.compare_baseline {
         tracing::info!("Starting baseline processing for {} intents", intents.len());
         let baseline_start = Instant::now();
         
         for (i, ui) in intents.iter().cloned().enumerate() {
+            // 🔑 Ensure unique signatures: refresh blockhash for EVERY baseline tx
+            track_get_latest_blockhash();
+            let mut bh = rpc.get_latest_blockhash()?;
+
             let mut build = make_build_vmsg(
                 payer_pubkey,
-                &mut blockhash,
+                &mut bh,
                 AltResolution::default(),
-                vec![ui.clone()], // one-intent baseline
+                vec![ui.clone()],
                 safety.clone(),
                 rpc.clone(),
                 commitment.clone(),
             );
             let rep = sender.simulate_build_and_send_with_report(&mut build, &[&payer], args.dry_run)?;
+
+            let sig_section = signatures_section_len(rep.required_signers);
+            let packet_bytes = rep.message_bytes + sig_section;
+            let max_msg_budget = safety.max_message_bytes_with_signers(rep.required_signers);
+            let max_packet_bytes = max_msg_budget + sig_section;
+            let guard_pass = rep.message_bytes <= max_msg_budget;
+
             baseline.push(TxCost {
                 signature: rep.signature.map(|s| s.to_string()),
                 used_cu: rep.used_cu,
@@ -447,6 +551,9 @@ fn main() -> Result<()> {
                 cu_price_micro_lamports: rep.final_plan.cu_price_microlamports,
                 message_bytes: rep.message_bytes,
                 required_signers: rep.required_signers,
+                packet_bytes,
+                max_packet_bytes,
+                packet_guard_pass: guard_pass,
                 base_fee_lamports: rep.base_fee_lamports,
                 priority_fee_lamports: rep.priority_fee_lamports,
                 total_fee_lamports: rep.total_fee_lamports,
@@ -500,7 +607,7 @@ fn main() -> Result<()> {
             StageMetric {
                 name: "rollup.execution".to_string(),
                 count: rollup_reports.len() as u64,
-                total_ms: 0, // We'd need to aggregate per-chunk timings
+                total_ms: 0, // (next pass) accumulate per-chunk timings
             },
         ],
         rpc: final_rpc_metrics.clone(),
@@ -508,11 +615,9 @@ fn main() -> Result<()> {
         rpc_url: args.rpc.clone(),
     };
     
-    // Print machine-readable JSON first
     println!("=== TRACING REPORT JSON ===");
     println!("{}", serde_json::to_string_pretty(&tracing_report)?);
     
-    // Pretty print + optional JSON
     println!("\n=== CPSR-Lite Demo Report ===");
     println!("intents: {}", report.intents);
     println!("dag layers: {:?}", report.dag_layers);
@@ -522,7 +627,6 @@ fn main() -> Result<()> {
         println!("savings: {} lamports ({:.2}%)", report.absolute_savings_lamports, report.savings_percent);
     }
     
-    // Print RPC metrics table
     println!("\n=== RPC METRICS ===");
     println!("| Metric                     | Count |");
     println!("|----------------------------|-------|");

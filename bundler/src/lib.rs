@@ -6,3 +6,4 @@ pub mod fee;
 pub mod occ;
 pub mod serializer;
 pub mod sender;
+pub mod fee_oracles;

@@ -1,35 +1,17 @@
-//! A percentile + EMA fee orause crate::fee::{FeeOracle, FeePlan};t on `getRecentPrioritizationFees`.
-//!
-//! Policy
-//! - Take P75 of recent priority-fee samples across probe accounts (fallback P90 if not enough data).
-//! - Smooth with an EMA (alpha ~0.2 by default) to avoid whiplash.
-//! - Apply 3% hysteresis: ignore tiny reprices (<3%) to reduce churn at the sender.
-//! - Clamp to configured min/max μLam/CU and max CU limit.
-//!
-//! Notes
-//! - Nodes expose fee samples from the most recent ~150 blocks; `getRecentPrioritizationFees` returns
-//!   per-account snapshots that we aggregate (we choose percentiles across the combined set).
-//! - This file is intentionally stateful (EMA + last price) via a Mutex so that multiple calls
-//!   to `suggest()` stabilize quickly within a running process.
-//!
-//! References:
-//! - getRecentPrioritizationFees (RPC): samples are cached for ~150 blocks. 
-//!   https://solana.com/docs/rpc/http/getrecentprioritizationfees
-//! - simulateTransaction exposes `unitsConsumed` (used by sender). 
-//!   https://solana.com/docs/rpc/http/simulatetransaction
-//! - isBlockhashValid (checked by sender before submit).
-//!   https://solana.com/docs/rpc/http/isblockhashvalid
+//! A percentile + EMA fee oracle built on `getRecentPrioritizationFees`.
+//! See docs in the file header of your previous version; logic unchanged.
 
-use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_response::RpcPrioritizationFee;
 use solana_sdk::pubkey::Pubkey;
 
 use crate::fee::{FeeOracle, FeePlan};
+use crate::sender::track_get_recent_prioritization_fees;
 
-// Global counter for getRecentPrioritizationFees calls
+// Global counter (exposed via sender metrics).
 static RPC_GET_RECENT_FEES_COUNT: AtomicU64 = AtomicU64::new(0);
 
 pub fn get_recent_fees_count() -> u64 {
@@ -40,9 +22,9 @@ pub fn get_recent_fees_count() -> u64 {
 pub struct RecentFeesOracle {
     pub rpc: Arc<RpcClient>,
     pub probe_accounts: Vec<Pubkey>,   // Accounts to probe; can be empty.
-    pub max_cu_limit: u64,             // e.g., 1_400_000 (cluster dependent)
+    pub max_cu_limit: u64,             // e.g., 1_400_000
     pub min_cu_price: u64,             // μLam/CU floor (e.g., 100)
-    pub max_cu_price: u64,             // μLam/CU ceiling (μLam/CU)
+    pub max_cu_price: u64,             // μLam/CU ceiling
     pub p_primary: f64,                // primary percentile (e.g., 0.75)
     pub p_fallback: f64,               // fallback percentile (e.g., 0.90)
     pub ema_alpha: f64,                // EMA smoothing factor (e.g., 0.20)
@@ -75,15 +57,14 @@ impl RecentFeesOracle {
 
     fn fetch_fees(&self) -> Vec<u64> {
         // If probe_accounts is empty, RPC returns recent fees anyway.
-        crate::sender::track_get_recent_prioritization_fees();
-        match self
-            .rpc
-            .get_recent_prioritization_fees(&self.probe_accounts)
-        {
-            Ok(list) if !list.is_empty() => list
-                .into_iter()
-                .map(|RpcPrioritizationFee { prioritization_fee, .. }| prioritization_fee as u64)
-                .collect(),
+        track_get_recent_prioritization_fees();
+        match self.rpc.get_recent_prioritization_fees(&self.probe_accounts) {
+            Ok(list) if !list.is_empty() => {
+                RPC_GET_RECENT_FEES_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                list.into_iter()
+                    .map(|RpcPrioritizationFee { prioritization_fee, .. }| prioritization_fee as u64)
+                    .collect()
+            }
             _ => vec![],
         }
     }
@@ -92,7 +73,6 @@ impl RecentFeesOracle {
     fn pct(sorted: &[u64], p: f64) -> Option<u64> {
         if sorted.is_empty() { return None; }
         let n = sorted.len();
-        // nearest-rank / linear index hybrid; conservative rounding up
         let idx = ((p.clamp(0.0, 1.0) * (n as f64 - 1.0)).ceil() as usize).min(n - 1);
         Some(sorted[idx])
     }
@@ -100,7 +80,6 @@ impl RecentFeesOracle {
     fn pick_price_with_ema(&self) -> u64 {
         let mut fees = self.fetch_fees();
         if fees.is_empty() {
-            // fallback to floor if no data
             return self.min_cu_price;
         }
         fees.sort_unstable();
@@ -120,7 +99,6 @@ impl RecentFeesOracle {
         };
         st.ema_price = Some(ema);
 
-        // hysteresis: only move if change >= hysteresis_bps
         let candidate = ema.round().clamp(self.min_cu_price as f64, self.max_cu_price as f64) as u64;
         match st.last_output {
             None => {
@@ -132,7 +110,6 @@ impl RecentFeesOracle {
                 let smaller = candidate.min(last);
                 let delta_bps = if bigger == 0 { 0 } else { ((bigger - smaller) * 10_000) / bigger };
                 if delta_bps < self.hysteresis_bps {
-                    // keep last
                     last
                 } else {
                     st.last_output = Some(candidate);
@@ -169,13 +146,12 @@ impl FeeOracle for RecentFeesOracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_client::rpc_client::RpcClient;
 
     #[test]
     fn percentile_indexing_is_conservative() {
-        let mut o = RecentFeesOracle::new(Arc::new(RpcClient::new_mock("".into())), vec![]);
-        o.min_cu_price = 100;
-        let data = vec![1u64, 2, 3, 10, 20, 100];
-        let mut d = data.clone();
+        let o = RecentFeesOracle::new(Arc::new(RpcClient::new_mock("".into())), vec![]);
+        let mut d = vec![1u64, 2, 3, 10, 20, 100];
         d.sort_unstable();
         assert_eq!(RecentFeesOracle::pct(&d, 0.75).unwrap(), 20);
         assert_eq!(RecentFeesOracle::pct(&d, 0.90).unwrap(), 100);
