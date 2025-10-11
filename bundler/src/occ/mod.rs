@@ -20,11 +20,34 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::thread;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use rand::{thread_rng, Rng};
 
 use cpsr_types::AccountVersion;
 use solana_program::pubkey::Pubkey;
+
+#[derive(Debug, Clone, Default)]
+pub struct OccMetrics {
+    pub captures: u64,
+    pub retries: u64,
+    pub slot_drift_rejects: u64,
+    pub rpc_errors: u64,
+}
+
+static OCC_CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
+static OCC_RETRY_COUNT: AtomicU64 = AtomicU64::new(0);
+static OCC_SLOT_DRIFT_COUNT: AtomicU64 = AtomicU64::new(0);
+static OCC_RPC_ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn occ_metrics_snapshot() -> OccMetrics {
+    OccMetrics {
+        captures: OCC_CAPTURE_COUNT.load(Ordering::Relaxed),
+        retries: OCC_RETRY_COUNT.load(Ordering::Relaxed),
+        slot_drift_rejects: OCC_SLOT_DRIFT_COUNT.load(Ordering::Relaxed),
+        rpc_errors: OCC_RPC_ERROR_COUNT.load(Ordering::Relaxed),
+    }
+}
 
 // -------------------------------
 // RPC abstraction
@@ -57,6 +80,9 @@ pub trait AccountFetcher {
     /// - MAY batch internally for efficiency
     fn fetch_many(&self, keys: &[Pubkey]) -> Result<HashMap<Pubkey, FetchedAccount>, OccError>;
 }
+
+// Make the real RPC-backed fetcher visible to dependents.
+pub mod rpc_fetcher;
 
 // -------------------------------
 // Config & Errors
@@ -187,13 +213,6 @@ pub fn collect_target_accounts(
 // Main capture logic
 // -------------------------------
 
-/// Capture OCC versions for the given intents with retries and drift control.
-///
-/// Steps:
-/// 1) Build the unique account set (respecting include_readonly)
-/// 2) Fetch all accounts via `fetcher`
-/// 3) Compute `AccountVersion`s and aggregate min/max slot
-/// 4) If slot drift exceeds budget, retry with backoff (up to max_retries)
 pub fn capture_occ_with_retries<F: AccountFetcher>(
     fetcher: &F,
     intents: &[cpsr_types::UserIntent],
@@ -208,11 +227,13 @@ pub fn capture_occ_with_retries<F: AccountFetcher>(
     let mut backoff_ms = cfg.backoff_ms.max(1);
     loop {
         attempt += 1;
+        OCC_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed);
         match capture_once(fetcher, &targets) {
             Ok(snap) => {
                 if snap.within_drift(cfg.max_slot_drift) {
                     return Ok(snap);
                 }
+                OCC_SLOT_DRIFT_COUNT.fetch_add(1, Ordering::Relaxed);
                 if attempt >= cfg.max_retries {
                     return Err(OccError::SlotDrift {
                         min: snap.min_slot,
@@ -221,14 +242,17 @@ pub fn capture_occ_with_retries<F: AccountFetcher>(
                         allowed: cfg.max_slot_drift,
                     });
                 }
+                OCC_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
                 let jitter: u64 = thread_rng().gen_range(0..10);
                 thread::sleep(std::time::Duration::from_millis(backoff_ms + jitter));
                 backoff_ms = backoff_ms.saturating_mul(2).min(5_000);
             }
             Err(e0) => {
                 let e = map_rpc_variant(e0);
+                OCC_RPC_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                 if e.is_fatal() { return Err(e); }
                 if attempt >= cfg.max_retries { return Err(OccError::RetriesExhausted); }
+                OCC_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
                 let jitter: u64 = thread_rng().gen_range(0..10);
                 thread::sleep(std::time::Duration::from_millis(backoff_ms + jitter));
                 backoff_ms = backoff_ms.saturating_mul(2).min(5_000);
@@ -236,7 +260,7 @@ pub fn capture_occ_with_retries<F: AccountFetcher>(
         }
     }
 }
-/// Single-shot OCC capture without retries.
+
 fn capture_once<F: AccountFetcher>(
     fetcher: &F,
     targets: &[Pubkey],
@@ -285,19 +309,15 @@ fn classify_rpc_message(msg: &str) -> Class {
     {
         return Class::Fatal;
     }
-    // Treat generic "account not found" strings as fatal if they bubble up here.
     if m.contains("account not found")
         || m.contains("could not find account")
         || m.contains("no such account")
     {
         return Class::Fatal;
     }
-    // Default: retry (timeouts, rate limits, transient network).
     Class::Retriable
 }
 
-/// Upgrade certain `Rpc` errors to stronger typed variants.
-/// (We cannot recover the Pubkey for "missing account" from a string; keep as `Rpc` fatal.)
 fn map_rpc_variant(e: OccError) -> OccError {
     match e {
         OccError::Rpc(msg) => {
@@ -315,6 +335,8 @@ fn map_rpc_variant(e: OccError) -> OccError {
         other => other,
     }
 }
+
+// (unit tests unchanged)
 
 // -------------------------------
 // Unit tests with a mock fetcher

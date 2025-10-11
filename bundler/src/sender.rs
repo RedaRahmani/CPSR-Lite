@@ -2,7 +2,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use solana_client::{
@@ -68,6 +68,8 @@ pub struct SendReport {
     pub base_fee_lamports: u64,             // 5000 * required_signers
     pub priority_fee_lamports: u64,         // (cu_limit * cu_price_microLam) / 1_000_000
     pub total_fee_lamports: u64,            // base + priority (excludes rent, etc.)
+    pub simulate_duration: Duration,        // wall-clock duration of simulate_transaction
+    pub send_duration: Option<Duration>,    // wall-clock duration of send_transaction (None when dry-run)
 }
 
 /// Maintains a sliding window of recent used CU to compute P95.
@@ -231,6 +233,8 @@ impl ReliableSender {
             plan.cu_limit, used, p95_used, plan.cu_price_microlamports
         );
 
+        let mut send_duration = None;
+
         if !dry_run {
             // Optional explicit pre-check. Safe to skip because preflight checks it anyway.
             if self.pre_check_blockhash {
@@ -261,10 +265,11 @@ impl ReliableSender {
                     ..Default::default()
                 },
             )?;
-            let send_duration = send_start.elapsed();
+            let send_elapsed = send_start.elapsed();
             RPC_SEND_TRANSACTION_COUNT.fetch_add(1, Ordering::Relaxed);
-            tracing::info!("send_transaction took {:?}", send_duration);
+            tracing::info!("send_transaction took {:?}", send_elapsed);
             signature = Some(sig);
+            send_duration = Some(send_elapsed);
         }
 
         let total_fee_lamports = base_fee_lamports + priority_fee_lamports;
@@ -277,6 +282,8 @@ impl ReliableSender {
             base_fee_lamports,
             priority_fee_lamports,
             total_fee_lamports,
+            simulate_duration: sim_duration,
+            send_duration,
         })
     }
 
@@ -287,5 +294,30 @@ impl ReliableSender {
     {
         let rep = self.simulate_build_and_send_with_report(build, signers, false)?;
         Ok(rep.signature.expect("signature missing"))
+    }
+
+    /// Async wrapper over [`simulate_build_and_send_with_report`] that delegates to a blocking task.
+    ///
+    /// Useful when the caller operates inside a Tokio runtime and wants to avoid blocking worker threads.
+    pub async fn simulate_build_and_send_with_report_async<FBuild, S>(
+        self: Arc<Self>,
+        build: FBuild,
+        signers: Vec<Arc<S>>,
+        dry_run: bool,
+    ) -> Result<SendReport>
+    where
+        FBuild: FnMut(FeePlan) -> Result<VersionedMessage> + Send + 'static,
+        S: Signer + Send + Sync + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let mut build = build;
+            let signer_refs: Vec<&dyn Signer> = signers
+                .iter()
+                .map(|s| s.as_ref() as &dyn Signer)
+                .collect();
+            self.simulate_build_and_send_with_report(&mut build, &signer_refs, dry_run)
+        })
+        .await
+        .map_err(|e| anyhow!("blocking send task join error: {e}"))?
     }
 }

@@ -11,15 +11,28 @@ use solana_sdk::{
     system_instruction,
     pubkey::Pubkey,
 };
-
+use bundler::pipeline::blockhash::BlockhashProvider;
 use bundler::{
-    alt::{AltManager, AltResolution, NoAltManager},
+    alt::{AltManager, AltResolution, NoAltManager, CachingAltManager},
+    alt::table_catalog::TableCatalog,
     chunking::{AltPolicy, BasicOracle as ChunkOracle, TxBudget, chunk_layer_with},
     dag::Dag,
-    occ::{FetchedAccount, OccConfig, capture_occ_with_retries},
-    sender::{ReliableSender, SendReport, CuScope, global_rpc_metrics_snapshot, track_get_latest_blockhash, track_is_blockhash_valid},
-    serializer::signatures_section_len,
     fee::FeeOracle,
+    // ⬇️ Drop FetchedAccount import; we only need OccConfig + metrics here
+    occ::{OccConfig, occ_metrics_snapshot},
+    // ⬇️ Import the REAL RPC fetcher implementation
+    occ::rpc_fetcher::RpcAccountFetcher,
+    pipeline::{
+        blockhash::{BlockhashManager, BlockhashPolicy},
+        rollup::{
+            send_layer_parallel, ChunkEstimates, ChunkOutcome, ChunkPlan, LayerResult,
+            ParallelLayerConfig, ParallelLayerDeps,
+        },
+    },
+    sender::{
+        ReliableSender, CuScope, global_rpc_metrics_snapshot, track_get_latest_blockhash,
+    },
+    serializer::signatures_section_len,
 };
 
 use cpsr_types::UserIntent;
@@ -85,6 +98,15 @@ struct Args {
     #[arg(long, default_value_t = false)]
     enable_alt: bool,
 
+    /// Cache TTL for ALT selections (ms).
+    #[arg(long, default_value_t = 5_000)]
+    alt_cache_ttl_ms: u64,
+
+    /// Provide on-chain LUT table pubkeys (comma-separated). If set, the ALT manager
+    /// will only offload keys found in these tables (real selection).
+    #[arg(long)]
+    alt_tables: Option<String>,
+
     /// Dry-run: simulate only, do not send
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -129,6 +151,18 @@ struct Args {
     #[arg(long, default_value_t = false)]
     fast_send: bool,
 
+    /// Max parallel chunk workers (1..12).
+    #[arg(long, default_value_t = 6)]
+    concurrency: usize,
+
+    /// Refresh blockhash if older than this (ms).
+    #[arg(long, default_value_t = 8_000)]
+    blockhash_max_age_ms: u64,
+
+    /// Refresh blockhash after this many uses.
+    #[arg(long, default_value_t = 16)]
+    blockhash_refresh_every_n: u32,
+
     /// Write a JSON report here (optional)
     #[arg(long)]
     out_report: Option<PathBuf>,
@@ -145,27 +179,6 @@ impl From<CuScopeCli> for CuScope {
             CuScopeCli::Global => CuScope::Global,
             CuScopeCli::PerLayer => CuScope::PerScope,
         }
-    }
-}
-
-/// Bridge our OCC trait to the RPC client.
-struct RpcAccountFetcher { rpc: Arc<RpcClient>, commitment: CommitmentConfig }
-impl bundler::occ::AccountFetcher for RpcAccountFetcher {
-    fn fetch_many(&self, keys: &[Pubkey]) -> Result<std::collections::HashMap<Pubkey, FetchedAccount>, bundler::occ::OccError> {
-        use bundler::occ::OccError;
-        let resp = self.rpc
-            .get_multiple_accounts_with_commitment(keys, self.commitment.clone())
-            .map_err(|e| OccError::Rpc(e.to_string()))?;
-        let observed_slot = resp.context.slot;
-        let mut out = std::collections::HashMap::with_capacity(keys.len());
-        for (i, maybe_acc) in resp.value.into_iter().enumerate() {
-            let key = keys[i];
-            let acc = maybe_acc.ok_or(OccError::MissingAccount(key))?;
-            out.insert(key, FetchedAccount {
-                key, lamports: acc.lamports, owner: acc.owner, data: acc.data, slot: observed_slot,
-            });
-        }
-        Ok(out)
     }
 }
 
@@ -202,6 +215,15 @@ struct DemoReport {
     baseline: Vec<TxCost>,
 }
 
+#[derive(Clone, Debug)]
+struct LayerSummary {
+    index: usize,
+    chunks: usize,
+    success: usize,
+    failure: usize,
+    wall_clock: Duration,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct StageMetric {
     name: String,
@@ -234,35 +256,19 @@ fn memo_ix(text: &str) -> solana_sdk::instruction::Instruction {
     Instruction { program_id: memo_pid, accounts: vec![], data: text.as_bytes().to_vec() }
 }
 
-// Helper to build a VersionedMessage for a set of intents
-// fn make_build_vmsg<'a>(
-//     payer_pk: solana_sdk::pubkey::Pubkey,
-//     bh: &'a mut solana_sdk::hash::Hash,
-//     alts: bundler::alt::AltResolution,
-//     chunk_intents: Vec<cpsr_types::UserIntent>,
-//     safety_cfg: estimator::config::SafetyMargins,
-//     rpc: std::sync::Arc<solana_client::rpc_client::RpcClient>,
-//     commitment: solana_sdk::commitment_config::CommitmentConfig,
-// ) -> impl FnMut(bundler::fee::FeePlan) -> anyhow::Result<solana_sdk::message::VersionedMessage> + 'a {
-//     move |plan: bundler::fee::FeePlan| {
-//         // Refresh blockhash if needed
-//         track_is_blockhash_valid();
-//         let still = rpc.is_blockhash_valid(bh, commitment.clone())?;
-//         if !still {
-//             tracing::info!("Blockhash invalid, refreshing");
-//             track_get_latest_blockhash();
-//             *bh = rpc.get_latest_blockhash()?;
-//         }
-//         let ctx = bundler::serializer::BuildTxCtx {
-//             payer: payer_pk,
-//             blockhash: *bh,
-//             fee: plan,
-//             alts: alts.clone(),
-//             safety: safety_cfg.clone(),
-//         };
-//         bundler::serializer::build_v0_message(&ctx, &chunk_intents)
-//     }
-// }
+fn percentile_duration(values: &mut Vec<Duration>, pct: f64) -> Option<Duration> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort();
+    let n = values.len();
+    let idx = (((n as f64) * pct).ceil() as usize)
+        .saturating_sub(1)
+        .min(n - 1);
+    Some(values[idx])
+}
+
+// (make_build_vmsg helper unchanged)
 fn make_build_vmsg<'a>(
     payer_pk: solana_sdk::pubkey::Pubkey,
     bh: &'a mut solana_sdk::hash::Hash,
@@ -273,7 +279,6 @@ fn make_build_vmsg<'a>(
     _commitment: solana_sdk::commitment_config::CommitmentConfig,
 ) -> impl FnMut(bundler::fee::FeePlan) -> anyhow::Result<solana_sdk::message::VersionedMessage> + 'a {
     move |plan: bundler::fee::FeePlan| {
-        // No is_blockhash_valid probe here; we trust the caller to refresh *bh when appropriate.
         let ctx = bundler::serializer::BuildTxCtx {
             payer: payer_pk,
             blockhash: *bh,
@@ -285,7 +290,8 @@ fn make_build_vmsg<'a>(
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -295,8 +301,10 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let payer = read_keypair_file(&args.payer)
-        .map_err(|e| anyhow!("reading keypair {:?}: {e}", args.payer))?;
+    let payer = Arc::new(
+        read_keypair_file(&args.payer)
+            .map_err(|e| anyhow!("reading keypair {:?}: {e}", args.payer))?
+    );
     let payer_pubkey = payer.pubkey();
 
     let commitment = parse_commitment(&args.commitment);
@@ -314,7 +322,6 @@ fn main() -> Result<()> {
         let parsed: Vec<UserIntent> = serde_json::from_str(&data).context("parsing intents JSON")?;
         parsed.into_iter().map(|ui| ui.normalized()).collect()
     } else if args.demo_mixed {
-        // Mixed workload: independent memos + contended transfers (same dest)
         let to_str = args.demo_conflicting_to.as_ref()
             .ok_or_else(|| anyhow!("--demo-mixed also requires --demo-conflicting-to <PUBKEY>"))?;
         let dest = Pubkey::from_str(to_str)
@@ -350,8 +357,58 @@ fn main() -> Result<()> {
     let occ_cfg = OccConfig::default();
 
     // --------- Deps ----------
-    let alt_mgr: Box<dyn AltManager> = Box::new(NoAltManager);
-    let account_fetcher = RpcAccountFetcher { rpc: rpc.clone(), commitment: commitment.clone() };
+    // Optional: build a real LUT catalog if --alt-tables is provided
+    let catalog = if let Some(list) = args.alt_tables.as_deref() {
+        let table_pks: Vec<Pubkey> = list
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| Pubkey::from_str(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| anyhow!("invalid --alt-tables list"))?;
+        if table_pks.is_empty() { None } else {
+            Some(Arc::new(TableCatalog::from_rpc(rpc.clone(), table_pks)?))
+        }
+    } else { None };
+
+    let mut alt_mgr_builder = CachingAltManager::new(
+        alt_policy.clone(),
+        Duration::from_millis(args.alt_cache_ttl_ms),
+    );
+    if let Some(cat) = &catalog {
+        alt_mgr_builder = alt_mgr_builder.with_catalog(cat.clone());
+    }
+    let alt_mgr: Arc<dyn AltManager> = if args.enable_alt {
+        Arc::new(alt_mgr_builder)
+    } else {
+        Arc::new(NoAltManager)
+    };
+
+    let account_fetcher = Arc::new(RpcAccountFetcher::new_with_drift(
+        rpc.clone(),
+        commitment.clone(),
+        occ_cfg.max_slot_drift,
+    ));
+
+    let max_age_ms = args.blockhash_max_age_ms.clamp(1_000, 120_000);
+    let refresh_every = args.blockhash_refresh_every_n.max(1);
+    let blockhash_policy = BlockhashPolicy {
+        max_age: Duration::from_millis(max_age_ms as u64),
+        refresh_every,
+    };
+    let blockhash_manager = Arc::new(BlockhashManager::new(
+        rpc.clone(),
+        commitment.clone(),
+        blockhash_policy.clone(),
+        !args.fast_send,
+    ));
+    tracing::info!(
+        target: "blockhash",
+        max_age_ms = max_age_ms,
+        refresh_every = refresh_every,
+        pre_check = !args.fast_send,
+        "Blockhash policy configured"
+    );
 
     // Choose fee oracle
     let fee_oracle: Box<dyn FeeOracle> = match args.fee_oracle {
@@ -365,7 +422,6 @@ fn main() -> Result<()> {
         FeeOracleCli::Recent => {
             use bundler::fee_oracles::recent::RecentFeesOracle;
 
-            // Parse optional probe accounts
             let probes: Vec<Pubkey> = args.probe_accounts
                 .as_deref()
                 .unwrap_or("")
@@ -387,10 +443,32 @@ fn main() -> Result<()> {
     };
 
     // Build sender and apply fast-send if requested
-    let mut sender = ReliableSender::with_scope(rpc.clone(), fee_oracle, args.cu_scope.into());
-    if args.fast_send {
-        sender = sender.with_fast_send();
-    }
+    let sender = {
+        let mut s = ReliableSender::with_scope(rpc.clone(), fee_oracle, args.cu_scope.into());
+        if args.fast_send {
+            s = s.with_fast_send();
+        }
+        Arc::new(s)
+    };
+
+    let concurrency = args.concurrency.clamp(1, 12);
+    let parallel_cfg_template = ParallelLayerConfig {
+        max_concurrency: concurrency,
+        max_attempts: 3,
+        base_backoff: Duration::from_millis(200),
+        max_backoff: Duration::from_millis(1_500),
+        dry_run: args.dry_run,
+    };
+
+    let parallel_deps = ParallelLayerDeps {
+        sender: sender.clone(),
+        payer: payer.clone(),
+        safety: safety.clone(),
+        alt_manager: alt_mgr.clone(),
+        occ_fetcher: account_fetcher.clone(),
+        occ_config: occ_cfg.clone(),
+        blockhash_provider: blockhash_manager.clone(),
+    };
 
     // --------- DAG & layers ----------
     let dag_start = Instant::now();
@@ -407,113 +485,176 @@ fn main() -> Result<()> {
     let layers_sizes: Vec<usize> = layers.iter().map(|l| l.len()).collect();
     tracing::info!("DAG has {} layers: {:?}", layers.len(), layers_sizes);
 
-    // Grab a recent blockhash up front
-    tracing::info!("Fetching initial blockhash");
-    track_get_latest_blockhash();
-    let mut blockhash = rpc.get_latest_blockhash()?;
-
     let mut rollup_reports: Vec<TxCost> = Vec::new();
+    let mut layer_summaries: Vec<LayerSummary> = Vec::new();
 
     // --------- ROLLUP path ----------
     tracing::info!("Starting rollup processing with {} layers", layers.len());
     for (layer_index, layer) in layers.iter().enumerate() {
-        let layer_start = Instant::now();
-        let span = tracing::info_span!("chunking.layer", layer_index = layer_index, layer_size = layer.len());
-        let _enter = span.enter();
-        
+        let layer_span = tracing::info_span!("chunking.layer", layer_index = layer_index, layer_size = layer.len());
+        let _guard = layer_span.enter();
+
         tracing::info!("Processing layer {} with {} intents", layer_index, layer.len());
         sender.start_scope();
 
         let chunking_start = Instant::now();
-        let groups = chunk_layer_with(&layer, &dag.nodes, &tx_budget, &alt_policy, &ChunkOracle)?;
+        let planned_chunks = chunk_layer_with(layer, &dag.nodes, &tx_budget, &alt_policy, &ChunkOracle)?;
         let chunking_duration = chunking_start.elapsed();
-        tracing::info!("Chunking layer {} took {:?}, produced {} chunks", layer_index, chunking_duration, groups.len());
-        
-        for node_ids in groups {
-            let chunk_span = tracing::info_span!("chunking.chunk", node_count = node_ids.len());
-            let _chunk_enter = chunk_span.enter();
-            
-            let chunk_intents: Vec<UserIntent> =
-                node_ids.iter().map(|&nid| dag.nodes[nid as usize].clone()).collect();
+        tracing::info!(
+            "Chunking layer {} took {:?}, produced {} chunks",
+            layer_index,
+            chunking_duration,
+            planned_chunks.len()
+        );
 
-            // OCC capture
-            let occ_start = Instant::now();
-            let occ_span = tracing::info_span!("occ.capture", key_count = chunk_intents.len());
-            let _occ_enter = occ_span.enter();
-            let _snap = capture_occ_with_retries(&account_fetcher, &chunk_intents, &occ_cfg)?;
-            let occ_duration = occ_start.elapsed();
-            tracing::info!("OCC capture took {:?} for {} keys", occ_duration, chunk_intents.len());
-            drop(_occ_enter);
-
-            // ALT resolve
-            let alt_start = Instant::now();
-            let alt_span = tracing::info_span!("alt.resolve", requested_count = chunk_intents.len());
-            let _alt_enter = alt_span.enter();
-            let alts: AltResolution = alt_mgr.resolve_tables(chunk_intents.len());
-            let alt_duration = alt_start.elapsed();
-            tracing::info!("ALT resolve took {:?} for {} intents, got {} tables", alt_duration, chunk_intents.len(), alts.tables.len());
-            drop(_alt_enter);
-            
-            let mut build = make_build_vmsg(
-                payer_pubkey,
-                &mut blockhash,
-                alts,
-                chunk_intents,
-                safety.clone(),
-                rpc.clone(),
-                commitment.clone(),
-            );
-
-            // Sender simulate + send
-            let sender_start = Instant::now();
-            let sender_span = tracing::info_span!("sender.simulate");
-            let _sender_enter = sender_span.enter();
-            let rep: SendReport = sender.simulate_build_and_send_with_report(&mut build, &[&payer], args.dry_run)?;
-            let sender_duration = sender_start.elapsed();
-
-            // Packet/guard logging
-            let sig_section = signatures_section_len(rep.required_signers);
-            let packet_bytes = rep.message_bytes + sig_section;
-            let max_msg_budget = safety.max_message_bytes_with_signers(rep.required_signers);
-            let max_packet_bytes = max_msg_budget + sig_section;
-            let guard_pass = rep.message_bytes <= max_msg_budget;
+        let mut chunk_plans = Vec::with_capacity(planned_chunks.len());
+        for (chunk_idx, planned) in planned_chunks.iter().enumerate() {
+            let chunk_intents: Vec<UserIntent> = planned
+                .node_ids
+                .iter()
+                .map(|&nid| dag.nodes[nid as usize].clone())
+                .collect();
             tracing::info!(
-                "Packet size: {}/{} bytes (signers={}, sig_section={}, message={}), guard_pass={}",
-                packet_bytes, max_packet_bytes, rep.required_signers, sig_section, rep.message_bytes, guard_pass
+                target: "planner",
+                chunk_index = chunk_idx,
+                node_count = planned.node_ids.len(),
+                est_cu = planned.est_cu,
+                est_msg_bytes = planned.est_message_bytes,
+                alt_ro = planned.alt_readonly,
+                alt_wr = planned.alt_writable,
+                "planned chunk"
             );
-
-            let send_action = if args.dry_run { "dry_run" } else { "sent" };
-            tracing::info!(
-                "Sender operation took {:?}, used_cu = {}, final_cu_limit = {}, final_cu_price = {}, action = {}",
-                sender_duration, rep.used_cu, rep.final_plan.cu_limit, rep.final_plan.cu_price_microlamports, send_action
-            );
-            
-            if let Some(sig) = &rep.signature {
-                tracing::info!(sig = %sig, "Transaction sent");
-            }
-            
-            rollup_reports.push(TxCost {
-                signature: rep.signature.map(|s| s.to_string()),
-                used_cu: rep.used_cu,
-                cu_limit: rep.final_plan.cu_limit,
-                cu_price_micro_lamports: rep.final_plan.cu_price_microlamports,
-                message_bytes: rep.message_bytes,
-                required_signers: rep.required_signers,
-                packet_bytes,
-                max_packet_bytes,
-                packet_guard_pass: guard_pass,
-                base_fee_lamports: rep.base_fee_lamports,
-                priority_fee_lamports: rep.priority_fee_lamports,
-                total_fee_lamports: rep.total_fee_lamports,
+            chunk_plans.push(ChunkPlan {
+                index: chunk_idx,
+                intents: chunk_intents,
+                estimates: ChunkEstimates {
+                    est_cu: planned.est_cu,
+                    est_msg_bytes: planned.est_message_bytes,
+                    alt_ro_count: planned.alt_readonly,
+                    alt_wr_count: planned.alt_writable,
+                },
             });
         }
-        
-        let layer_duration = layer_start.elapsed();
-        tracing::info!("Layer {} completed in {:?}", layer_index, layer_duration);
-        
-        tracing::info!("Refreshing blockhash after layer {}", layer_index);
-        track_get_latest_blockhash();
-        blockhash = rpc.get_latest_blockhash()?;
+
+        let mut cfg = parallel_cfg_template.clone();
+        if chunk_plans.len() <= 1 {
+            cfg.max_concurrency = 1;
+        }
+        let use_parallel = cfg.max_concurrency > 1 && chunk_plans.len() > 1;
+
+        let LayerResult { layer_index: _, wall_clock, chunks } =
+            send_layer_parallel(layer_index, chunk_plans, parallel_deps.clone(), cfg).await;
+
+        let mut layer_success = 0usize;
+        let mut layer_failure = 0usize;
+        let mut simulate_durations: Vec<Duration> = Vec::new();
+        let mut send_durations: Vec<Duration> = Vec::new();
+
+        for chunk in chunks {
+            match chunk.outcome {
+                ChunkOutcome::Success(success) => {
+                    layer_success += 1;
+                    simulate_durations.push(success.report.simulate_duration);
+                    if let Some(send_dur) = success.report.send_duration {
+                        send_durations.push(send_dur);
+                    }
+
+                    let sig_section = signatures_section_len(success.report.required_signers);
+                    let packet_bytes = success.report.message_bytes + sig_section;
+                    let max_msg_budget =
+                        safety.max_message_bytes_with_signers(success.report.required_signers);
+                    let max_packet_bytes = max_msg_budget + sig_section;
+                    let guard_pass = success.report.message_bytes <= max_msg_budget;
+
+                    tracing::info!(
+                        target: "pipeline",
+                        layer_index,
+                        chunk_index = chunk.index,
+                        attempts = chunk.attempts,
+                        total_ms = chunk.timings.total.as_millis(),
+                        simulate_ms = success.report.simulate_duration.as_millis(),
+                        send_ms = success
+                            .report
+                            .send_duration
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0),
+                        est_cu = chunk.estimates.est_cu,
+                        est_msg_bytes = chunk.estimates.est_msg_bytes,
+                        alt_keys = success.alt_resolution.stats.keys_offloaded,
+                        alt_saved_bytes = success.alt_resolution.stats.estimated_saved_bytes,
+                        last_valid_block_height = success.lease.last_valid_block_height,
+                        "chunk completed"
+                    );
+
+                    if let Some(sig) = &success.report.signature {
+                        tracing::info!(
+                            target: "pipeline",
+                            layer_index,
+                            chunk_index = chunk.index,
+                            sig = %sig,
+                            "transaction sent"
+                        );
+                    }
+
+                    rollup_reports.push(TxCost {
+                        signature: success.report.signature.map(|s| s.to_string()),
+                        used_cu: success.report.used_cu,
+                        cu_limit: success.report.final_plan.cu_limit,
+                        cu_price_micro_lamports: success.report.final_plan.cu_price_microlamports,
+                        message_bytes: success.report.message_bytes,
+                        required_signers: success.report.required_signers,
+                        packet_bytes,
+                        max_packet_bytes,
+                        packet_guard_pass: guard_pass,
+                        base_fee_lamports: success.report.base_fee_lamports,
+                        priority_fee_lamports: success.report.priority_fee_lamports,
+                        total_fee_lamports: success.report.total_fee_lamports,
+                    });
+                }
+                ChunkOutcome::Failed { error, retriable, stage } => {
+                    layer_failure += 1;
+                    tracing::error!(
+                        target: "pipeline",
+                        layer_index,
+                        chunk_index = chunk.index,
+                        attempts = chunk.attempts,
+                        retriable,
+                        ?stage,
+                        est_cu = chunk.estimates.est_cu,
+                        est_msg_bytes = chunk.estimates.est_msg_bytes,
+                        est_alt_ro = chunk.estimates.alt_ro_count,
+                        est_alt_wr = chunk.estimates.alt_wr_count,
+                        "chunk failed: {error:?}"
+                    );
+                }
+            }
+        }
+
+        let p95_sim = percentile_duration(&mut simulate_durations, 0.95);
+        let p95_send = percentile_duration(&mut send_durations, 0.95);
+
+        tracing::info!(
+            target: "pipeline",
+            layer_index,
+            use_parallel,
+            chunks_total = layer_success + layer_failure,
+            chunks_success = layer_success,
+            chunks_failed = layer_failure,
+            wall_clock_ms = wall_clock.as_millis(),
+            p95_sim_ms = p95_sim.map(|d| d.as_millis()).unwrap_or(0),
+            p95_send_ms = p95_send.map(|d| d.as_millis()).unwrap_or(0),
+            "layer execution complete"
+        );
+
+        layer_summaries.push(LayerSummary {
+            index: layer_index,
+            chunks: layer_success + layer_failure,
+            success: layer_success,
+            failure: layer_failure,
+            wall_clock,
+        });
+
+        blockhash_manager.mark_layer_boundary();
     }
 
     // --------- BASELINE path ----------
@@ -523,7 +664,6 @@ fn main() -> Result<()> {
         let baseline_start = Instant::now();
         
         for (i, ui) in intents.iter().cloned().enumerate() {
-            // 🔑 Ensure unique signatures: refresh blockhash for EVERY baseline tx
             track_get_latest_blockhash();
             let mut bh = rpc.get_latest_blockhash()?;
 
@@ -536,7 +676,7 @@ fn main() -> Result<()> {
                 rpc.clone(),
                 commitment.clone(),
             );
-            let rep = sender.simulate_build_and_send_with_report(&mut build, &[&payer], args.dry_run)?;
+            let rep = sender.simulate_build_and_send_with_report(&mut build, &[payer.as_ref()], args.dry_run)?;
 
             let sig_section = signatures_section_len(rep.required_signers);
             let packet_bytes = rep.message_bytes + sig_section;
@@ -607,7 +747,7 @@ fn main() -> Result<()> {
             StageMetric {
                 name: "rollup.execution".to_string(),
                 count: rollup_reports.len() as u64,
-                total_ms: 0, // (next pass) accumulate per-chunk timings
+                total_ms: 0,
             },
         ],
         rpc: final_rpc_metrics.clone(),
@@ -627,6 +767,64 @@ fn main() -> Result<()> {
         println!("savings: {} lamports ({:.2}%)", report.absolute_savings_lamports, report.savings_percent);
     }
     
+    let bh_metrics = blockhash_manager.metrics();
+    println!("\n=== BLOCKHASH METRICS ===");
+    println!("refresh_initial            : {}", bh_metrics.refresh_initial);
+    println!("refresh_manual             : {}", bh_metrics.refresh_manual);
+    println!("refresh_age                : {}", bh_metrics.refresh_age);
+    println!("refresh_quota              : {}", bh_metrics.refresh_quota);
+    println!("refresh_layer_boundary     : {}", bh_metrics.refresh_layer);
+    println!("refresh_validation_failed  : {}", bh_metrics.refresh_validation);
+    println!("leases_issued              : {}", bh_metrics.leases_issued);
+    let stale_pct = if bh_metrics.leases_issued > 0 {
+        (bh_metrics.stale_detected as f64 * 100.0) / (bh_metrics.leases_issued as f64)
+    } else {
+        0.0
+    };
+    println!(
+        "stale_detected            : {} ({:.3}%)",
+        bh_metrics.stale_detected,
+        stale_pct
+    );
+
+        let alt_metrics = alt_mgr.metrics();
+    println!("\n=== ALT METRICS ===");
+    println!("resolutions               : {}", alt_metrics.total_resolutions);
+    let hit_pct = if alt_metrics.total_resolutions > 0 {
+        (alt_metrics.cache_hits as f64 * 100.0) / (alt_metrics.total_resolutions as f64)
+    } else {
+        0.0
+    };
+    println!(
+        "cache_hits                : {} ({:.2}%)",
+        alt_metrics.cache_hits,
+        hit_pct
+    );
+    println!("keys_offloaded            : {}", alt_metrics.keys_offloaded);
+    println!("readonly_offloaded        : {}", alt_metrics.readonly_offloaded);
+    println!("writable_offloaded        : {}", alt_metrics.writable_offloaded);
+    println!("estimated_bytes_saved     : {}", alt_metrics.estimated_saved_bytes);
+
+
+    println!("\n=== LAYER SUMMARIES ===");
+    for summary in &layer_summaries {
+        println!(
+            "layer {:02}: chunks={} success={} failure={} wall_clock_ms={}",
+            summary.index,
+            summary.chunks,
+            summary.success,
+            summary.failure,
+            summary.wall_clock.as_millis()
+        );
+    }
+
+    let occ_metrics = occ_metrics_snapshot();
+    println!("\n=== OCC METRICS ===");
+    println!("captures                  : {}", occ_metrics.captures);
+    println!("retries                   : {}", occ_metrics.retries);
+    println!("slot_drift_rejects        : {}", occ_metrics.slot_drift_rejects);
+    println!("rpc_errors                : {}", occ_metrics.rpc_errors);
+
     println!("\n=== RPC METRICS ===");
     println!("| Metric                     | Count |");
     println!("|----------------------------|-------|");
