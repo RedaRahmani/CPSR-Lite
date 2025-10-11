@@ -712,6 +712,7 @@ dependencies = [
  "solana-pubkey",
  "solana-sdk",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

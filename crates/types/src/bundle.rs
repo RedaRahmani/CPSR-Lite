@@ -25,6 +25,8 @@ pub struct Chunk {
     /// Hints only (for pricing/planning) – not consensus
     pub est_cu: u32,
     pub est_msg_bytes: u32,
+    pub alt_ro_count: u32,
+    pub alt_wr_count: u32,
 }
 
 impl Chunk {
@@ -114,6 +116,8 @@ mod tests {
             last_valid_block_height: 0,
             est_cu: 0,
             est_msg_bytes: 0,
+            alt_ro_count: 0,
+            alt_wr_count: 0,
         };
         let mut c2 = c1.clone();
         c2.occ_versions.swap(0,1);
@@ -157,6 +161,8 @@ mod more_tests {
             last_valid_block_height: 0,
             est_cu: 0,
             est_msg_bytes: 0,
+            alt_ro_count: 0,
+            alt_wr_count: 0,
         };
         c.recompute_merkle_root();
         let id1 = c.id();
@@ -192,6 +198,8 @@ fn bundle_root_changes_with_chunk_order() {
             last_valid_block_height: 0,
             est_cu: 0,
             est_msg_bytes: 0,
+            alt_ro_count: 0,
+            alt_wr_count: 0,
         };
         c.recompute_merkle_root();
         c

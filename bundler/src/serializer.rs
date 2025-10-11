@@ -13,6 +13,9 @@ use estimator::config::SafetyMargins;
 use crate::fee::FeePlan;
 use crate::alt::AltResolution;
 
+// NEW: expose precheck submodule
+pub mod precheck;
+
 /// Context for one transaction build (unsigned message only).
 #[derive(Clone, Debug)]
 pub struct BuildTxCtx {
@@ -46,6 +49,9 @@ pub fn signatures_section_len(required_signers: usize) -> usize {
 /// Build a v0 *message* (not a signed transaction). Caller will sign later.
 pub fn build_v0_message(ctx: &BuildTxCtx, intents: &[UserIntent]) -> Result<VersionedMessage> {
     if intents.is_empty() { return Err(anyhow!("no intents")); }
+
+    // (light guard) validate LUTs shape up-front
+    precheck::validate_alt_resolution(&ctx.alts)?;
 
     // 1) Prepend compute-budget ixs.
     let mut ixs: Vec<Instruction> = vec![

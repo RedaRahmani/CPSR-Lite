@@ -4,12 +4,20 @@
 
 use std::collections::BTreeSet;
 
-use cpsr_types::intent::{AccountAccess, AccessKind};
 use cpsr_types::UserIntent;
 use solana_program::instruction::Instruction;
 use solana_program::pubkey::Pubkey;
 
 use crate::dag::NodeId;
+
+#[derive(Debug, Clone)]
+pub struct PlannedChunk {
+    pub node_ids: Vec<NodeId>,
+    pub est_cu: u64,
+    pub est_message_bytes: usize,
+    pub alt_readonly: usize,
+    pub alt_writable: usize,
+}
 
 // ---------- Budgets ----------
 
@@ -149,7 +157,7 @@ pub fn chunk_layer(
     layer: &[NodeId],
     intents: &[UserIntent],
     budget: &TxBudget,
-) -> Result<Vec<Vec<NodeId>>, ChunkError> {
+) -> Result<Vec<PlannedChunk>, ChunkError> {
     // Use the smarter oracle by default.
     let oracle = ProgramAwareOracle::default();
     chunk_layer_with(layer, intents, budget, &AltPolicy::default(), &oracle)
@@ -161,14 +169,14 @@ pub fn chunk_layer_with<O: BudgetOracle>(
     budget: &TxBudget,
     alt: &AltPolicy,
     oracle: &O,
-) -> Result<Vec<Vec<NodeId>>, ChunkError> {
+) -> Result<Vec<PlannedChunk>, ChunkError> {
     let mut fps = Vec::with_capacity(layer.len());
     for &nid in layer {
         let intent = &intents[nid as usize];
         fps.push(IntentFootprint::from_intent(intent, budget, oracle));
     }
 
-    let mut chunks: Vec<Vec<NodeId>> = Vec::new();
+    let mut chunks: Vec<PlannedChunk> = Vec::new();
     let mut cur = ChunkAccumulator::new(budget, alt);
 
     for (i, &nid) in layer.iter().enumerate() {
@@ -186,7 +194,8 @@ pub fn chunk_layer_with<O: BudgetOracle>(
 
         if !cur.can_add(fp) {
             if !cur.nodes.is_empty() {
-                chunks.push(std::mem::take(&mut cur.nodes));
+                let chunk = cur.take_planned_chunk();
+                chunks.push(chunk);
                 cur.reset(budget, alt);
             }
         }
@@ -195,7 +204,8 @@ pub fn chunk_layer_with<O: BudgetOracle>(
     }
 
     if !cur.nodes.is_empty() {
-        chunks.push(cur.nodes);
+        let chunk = cur.take_planned_chunk();
+        chunks.push(chunk);
     }
 
     Ok(chunks)
@@ -218,8 +228,13 @@ fn delta_sv(old: usize, new: usize) -> usize {
 }
 
 #[derive(Debug, Clone)]
+struct KeyMeta {
+    pubkey: Pubkey,
+    writable: bool,
+}
+
 struct IntentFootprint {
-    keys: Vec<Pubkey>,     // program + metas (ordered)
+    keys: Vec<KeyMeta>,    // program + metas (ordered)
     instr_bytes: usize,    // compiled instruction bytes
     intent_cu: u64,        // CU estimate
 }
@@ -229,8 +244,10 @@ impl IntentFootprint {
         let ix = &intent.ix;
 
         let mut keys = Vec::with_capacity(ix.accounts.len() + 1);
-        keys.push(ix.program_id);
-        for m in &ix.accounts { keys.push(m.pubkey); }
+        keys.push(KeyMeta { pubkey: ix.program_id, writable: false });
+        for m in &ix.accounts {
+            keys.push(KeyMeta { pubkey: m.pubkey, writable: m.is_writable });
+        }
 
         let mut cu = oracle.cu_for_intent(intent);
         if cu == 0 { cu = budget.default_cu_per_intent; }
@@ -302,6 +319,8 @@ struct ChunkAccumulator<'a> {
     nodes: Vec<NodeId>,
     message_keys: BTreeSet<Pubkey>,
     alt_keys: BTreeSet<Pubkey>,
+    alt_ro_keys: BTreeSet<Pubkey>,
+    alt_wr_keys: BTreeSet<Pubkey>,
     bytes: usize,
     cu: u64,
     instrs: usize,
@@ -323,6 +342,8 @@ impl<'a> ChunkAccumulator<'a> {
             nodes: Vec::new(),
             message_keys: BTreeSet::new(),
             alt_keys: BTreeSet::new(),
+            alt_ro_keys: BTreeSet::new(),
+            alt_wr_keys: BTreeSet::new(),
             bytes,
             cu: 0,
             instrs: 0,
@@ -335,6 +356,8 @@ impl<'a> ChunkAccumulator<'a> {
         self.nodes.clear();
         self.message_keys.clear();
         self.alt_keys.clear();
+        self.alt_ro_keys.clear();
+        self.alt_wr_keys.clear();
         self.bytes = BASE_MESSAGE_OVERHEAD
             + budget.byte_slack
             + shortvec_len(0)  // keys
@@ -351,8 +374,9 @@ impl<'a> ChunkAccumulator<'a> {
         let mut new_message_keys = 0usize;
         let mut new_alt_keys = 0usize;
 
-        for k in &fp.keys {
-            if self.message_keys.contains(k) || self.alt_keys.contains(k) { continue; }
+        for meta in &fp.keys {
+            let key = meta.pubkey;
+            if self.message_keys.contains(&key) || self.alt_keys.contains(&key) { continue; }
 
             if self.alt.enabled {
                 let used_in_msg = self.message_keys.len().min(self.alt.reserve_message_keys);
@@ -396,8 +420,9 @@ impl<'a> ChunkAccumulator<'a> {
         let (prospective_msg_keys, prospective_alt_keys) = if self.alt.enabled {
             let mut new_msg = 0usize;
             let mut new_alt = 0usize;
-            for k in &fp.keys {
-                if self.message_keys.contains(k) || self.alt_keys.contains(k) { continue; }
+            for meta in &fp.keys {
+                let key = meta.pubkey;
+                if self.message_keys.contains(&key) || self.alt_keys.contains(&key) { continue; }
                 let used = self.message_keys.len().min(self.alt.reserve_message_keys);
                 if used < self.alt.reserve_message_keys { new_msg += 1; } else { new_alt += 1; }
             }
@@ -414,13 +439,15 @@ impl<'a> ChunkAccumulator<'a> {
     }
 
     fn add(&mut self, nid: NodeId, fp: &IntentFootprint) {
-        for k in &fp.keys {
-            if self.message_keys.contains(k) || self.alt_keys.contains(k) { continue; }
+        for meta in &fp.keys {
+            let key = meta.pubkey;
+            if self.message_keys.contains(&key) || self.alt_keys.contains(&key) { continue; }
             let used = self.message_keys.len().min(self.alt.reserve_message_keys);
             if self.alt.enabled && used >= self.alt.reserve_message_keys {
-                self.alt_keys.insert(*k);
+                self.alt_keys.insert(key);
+                if meta.writable { self.alt_wr_keys.insert(key); } else { self.alt_ro_keys.insert(key); }
             } else {
-                self.message_keys.insert(*k);
+                self.message_keys.insert(key);
             }
         }
         let (add_bytes, _add_unique_total, add_instrs, add_cu, alt_first) = self.deltas_for(fp);
@@ -429,6 +456,16 @@ impl<'a> ChunkAccumulator<'a> {
         self.cu = self.cu.saturating_add(add_cu);
         if alt_first { self.alt_used = true; }
         self.nodes.push(nid);
+    }
+
+    fn take_planned_chunk(&mut self) -> PlannedChunk {
+        PlannedChunk {
+            node_ids: std::mem::take(&mut self.nodes),
+            est_cu: self.cu,
+            est_message_bytes: self.bytes,
+            alt_readonly: self.alt_ro_keys.len(),
+            alt_writable: self.alt_wr_keys.len(),
+        }
     }
 }
 
@@ -457,6 +494,9 @@ mod more_chunk_tests {
         budget.max_bytes = 900; // intentionally low
         let chunks = chunk_layer(&layer, &intents, &budget).unwrap();
         assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].node_ids, vec![0]);
+        assert_eq!(chunks[1].node_ids, vec![1]);
+        assert!(chunks[0].est_message_bytes > 0);
     }
 
     #[test]
@@ -471,5 +511,8 @@ mod more_chunk_tests {
         budget.max_cu = budget.default_cu_per_intent; // allow exactly one intent per chunk
         let chunks = chunk_layer(&layer, &intents, &budget).unwrap();
         assert_eq!(chunks.len(), 3);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.node_ids, vec![idx as NodeId]);
+        }
     }
 }
