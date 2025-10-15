@@ -1,17 +1,13 @@
+use crate::alt::AltResolution;
+use crate::fee::FeePlan;
 use anyhow::{anyhow, Result};
 use bincode;
-use solana_sdk::{
-    compute_budget::ComputeBudgetInstruction,
-    hash::Hash,
-    instruction::Instruction,
-    message::v0::Message as MessageV0,
-    message::VersionedMessage,
-    pubkey::Pubkey,
-};
 use cpsr_types::UserIntent;
 use estimator::config::SafetyMargins;
-use crate::fee::FeePlan;
-use crate::alt::AltResolution;
+use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction, hash::Hash, instruction::Instruction,
+    message::v0::Message as MessageV0, message::VersionedMessage, pubkey::Pubkey,
+};
 
 // NEW: expose precheck submodule
 pub mod precheck;
@@ -33,7 +29,9 @@ pub fn shortvec_len(n: usize) -> usize {
     let mut bytes = 0;
     loop {
         bytes += 1;
-        if x < 0x80 { break; }
+        if x < 0x80 {
+            break;
+        }
         x >>= 7;
     }
     bytes
@@ -48,7 +46,9 @@ pub fn signatures_section_len(required_signers: usize) -> usize {
 
 /// Build a v0 *message* (not a signed transaction). Caller will sign later.
 pub fn build_v0_message(ctx: &BuildTxCtx, intents: &[UserIntent]) -> Result<VersionedMessage> {
-    if intents.is_empty() { return Err(anyhow!("no intents")); }
+    if intents.is_empty() {
+        return Err(anyhow!("no intents"));
+    }
 
     // (light guard) validate LUTs shape up-front
     precheck::validate_alt_resolution(&ctx.alts)?;
@@ -72,7 +72,9 @@ pub fn build_v0_message(ctx: &BuildTxCtx, intents: &[UserIntent]) -> Result<Vers
     if message_bytes > max_msg {
         return Err(anyhow!(
             "message {}B exceeds budget {}B (reserved for {} signers)",
-            message_bytes, max_msg, required_signers
+            message_bytes,
+            max_msg,
+            required_signers
         ));
     }
 
@@ -90,7 +92,7 @@ mod tests {
         let ix = Instruction {
             program_id: program,
             accounts: vec![AccountMeta::new(acc, false)],
-            data: vec![1,2,3],
+            data: vec![1, 2, 3],
         };
         UserIntent::new(Pubkey::new_unique(), ix, 0, None)
     }
@@ -118,7 +120,10 @@ mod tests {
         let ctx = BuildTxCtx {
             payer,
             blockhash: Hash::new_unique(),
-            fee: FeePlan { cu_limit: 100_000, cu_price_microlamports: 0 },
+            fee: FeePlan {
+                cu_limit: 100_000,
+                cu_price_microlamports: 0,
+            },
             alts: AltResolution::default(),
             safety: SafetyMargins::default(),
         };
@@ -134,15 +139,24 @@ mod tests {
     #[test]
     fn fails_when_message_budget_too_small() {
         let payer = Pubkey::new_unique();
-        let tiny = SafetyMargins { max_msg_bytes: 16, bytes_slack: 0, ..SafetyMargins::default() };
+        let tiny = SafetyMargins {
+            max_msg_bytes: 16,
+            bytes_slack: 0,
+            ..SafetyMargins::default()
+        };
         let ctx = BuildTxCtx {
             payer,
             blockhash: Hash::new_unique(),
-            fee: FeePlan { cu_limit: 100_000, cu_price_microlamports: 0 },
+            fee: FeePlan {
+                cu_limit: 100_000,
+                cu_price_microlamports: 0,
+            },
             alts: AltResolution::default(),
             safety: tiny,
         };
-        let err = build_v0_message(&ctx, &[mk_intent()]).err().expect("should error");
+        let err = build_v0_message(&ctx, &[mk_intent()])
+            .err()
+            .expect("should error");
         assert!(format!("{}", err).contains("exceeds budget"));
     }
 }

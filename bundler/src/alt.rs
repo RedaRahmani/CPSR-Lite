@@ -197,11 +197,20 @@ impl CachingAltManager {
                 .iter()
                 .filter(|u| resolvable.contains(&u.pubkey))
                 .fold((0usize, 0usize), |(ro, wr), u| {
-                    if u.writable { (ro, wr + 1) } else { (ro + 1, wr) }
+                    if u.writable {
+                        (ro, wr + 1)
+                    } else {
+                        (ro + 1, wr)
+                    }
                 });
 
-            let saved = estimate_saved_bytes(&self.policy,
-                &offload.into_iter().filter(|u| resolvable.contains(&u.pubkey)).collect::<Vec<_>>());
+            let saved = estimate_saved_bytes(
+                &self.policy,
+                &offload
+                    .into_iter()
+                    .filter(|u| resolvable.contains(&u.pubkey))
+                    .collect::<Vec<_>>(),
+            );
 
             let resolution = AltResolution {
                 tables,

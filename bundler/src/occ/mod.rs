@@ -18,11 +18,10 @@
 //! - On-chain, you should verify fields directly rather than recomputing BLAKE3.
 //!   This module computes `data_hash64` off-chain from raw account data.
 
-use std::collections::{BTreeSet, HashMap};
-use std::thread;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 use rand::{thread_rng, Rng};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 
 use cpsr_types::AccountVersion;
 use solana_program::pubkey::Pubkey;
@@ -115,11 +114,13 @@ impl Default for OccConfig {
 }
 impl Class {
     #[inline]
-    fn is_fatal(self) -> bool { matches!(self, Class::Fatal) }
+    fn is_fatal(self) -> bool {
+        matches!(self, Class::Fatal)
+    }
 }
 
 /// Errors from OCC capture.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Clone)]
 pub enum OccError {
     #[error("rpc fetch error: {0}")]
     Rpc(String),
@@ -128,7 +129,12 @@ pub enum OccError {
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error("slot drift too large (min={min}, max={max}, drift={drift}, allowed={allowed})")]
-    SlotDrift { min: u64, max: u64, drift: u64, allowed: u64 },
+    SlotDrift {
+        min: u64,
+        max: u64,
+        drift: u64,
+        allowed: u64,
+    },
     #[error("exceeded max retries")]
     RetriesExhausted,
 }
@@ -219,8 +225,28 @@ pub fn capture_occ_with_retries<F: AccountFetcher>(
     cfg: &OccConfig,
 ) -> Result<OccSnapshot, OccError> {
     let targets = collect_target_accounts(intents, cfg.include_readonly);
+    capture_with_targets(fetcher, &targets, cfg)
+}
+
+pub fn capture_occ_with_retries_on_keys<F: AccountFetcher>(
+    fetcher: &F,
+    accounts: &[Pubkey],
+    cfg: &OccConfig,
+) -> Result<OccSnapshot, OccError> {
+    capture_with_targets(fetcher, accounts, cfg)
+}
+
+fn capture_with_targets<F: AccountFetcher>(
+    fetcher: &F,
+    targets: &[Pubkey],
+    cfg: &OccConfig,
+) -> Result<OccSnapshot, OccError> {
     if targets.is_empty() {
-        return Ok(OccSnapshot { versions: Vec::new(), min_slot: 0, max_slot: 0 });
+        return Ok(OccSnapshot {
+            versions: Vec::new(),
+            min_slot: 0,
+            max_slot: 0,
+        });
     }
 
     let mut attempt = 0usize;
@@ -228,7 +254,7 @@ pub fn capture_occ_with_retries<F: AccountFetcher>(
     loop {
         attempt += 1;
         OCC_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed);
-        match capture_once(fetcher, &targets) {
+        match capture_once(fetcher, targets) {
             Ok(snap) => {
                 if snap.within_drift(cfg.max_slot_drift) {
                     return Ok(snap);
@@ -250,8 +276,12 @@ pub fn capture_occ_with_retries<F: AccountFetcher>(
             Err(e0) => {
                 let e = map_rpc_variant(e0);
                 OCC_RPC_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
-                if e.is_fatal() { return Err(e); }
-                if attempt >= cfg.max_retries { return Err(OccError::RetriesExhausted); }
+                if e.is_fatal() {
+                    return Err(e);
+                }
+                if attempt >= cfg.max_retries {
+                    return Err(OccError::RetriesExhausted);
+                }
                 OCC_RETRY_COUNT.fetch_add(1, Ordering::Relaxed);
                 let jitter: u64 = thread_rng().gen_range(0..10);
                 thread::sleep(std::time::Duration::from_millis(backoff_ms + jitter));
@@ -287,7 +317,11 @@ fn capture_once<F: AccountFetcher>(
         });
     }
 
-    Ok(OccSnapshot { versions, min_slot, max_slot })
+    Ok(OccSnapshot {
+        versions,
+        min_slot,
+        max_slot,
+    })
 }
 
 // -------------------------------
@@ -356,7 +390,10 @@ mod tests {
 
     impl MockFetcher {
         fn new() -> Self {
-            Self { inner: HashMap::new(), fail_with: None }
+            Self {
+                inner: HashMap::new(),
+                fail_with: None,
+            }
         }
         fn insert(&mut self, key: Pubkey, lamports: u64, owner: Pubkey, data: Vec<u8>, slot: u64) {
             self.inner.insert(key, (lamports, owner, data, slot));
@@ -377,7 +414,13 @@ mod tests {
                     .clone();
                 out.insert(
                     *k,
-                    FetchedAccount { key: *k, lamports, owner, data, slot },
+                    FetchedAccount {
+                        key: *k,
+                        lamports,
+                        owner,
+                        data,
+                        slot,
+                    },
                 );
             }
             Ok(out)
@@ -385,7 +428,7 @@ mod tests {
     }
 
     fn mk_intent_touching(key: Pubkey) -> cpsr_types::UserIntent {
-        use cpsr_types::intent::{AccountAccess, AccessKind};
+        use cpsr_types::intent::{AccessKind, AccountAccess};
         let program_id = Pubkey::new_unique();
         let actor = Pubkey::new_unique();
         let ix = Instruction {
@@ -393,7 +436,10 @@ mod tests {
             accounts: vec![AccountMeta::new(key, false)],
             data: vec![],
         };
-        let accesses = vec![AccountAccess { pubkey: key, access: AccessKind::ReadOnly }];
+        let accesses = vec![AccountAccess {
+            pubkey: key,
+            access: AccessKind::ReadOnly,
+        }];
         cpsr_types::UserIntent {
             actor,
             ix,
@@ -421,7 +467,14 @@ mod tests {
         assert_eq!(snap.max_slot, 102);
         assert_eq!(snap.versions.len(), 2);
         let dh_a = data_hash64(&[1, 2, 3]);
-        assert_eq!(snap.versions.iter().find(|v| v.key == a).unwrap().data_hash64, dh_a);
+        assert_eq!(
+            snap.versions
+                .iter()
+                .find(|v| v.key == a)
+                .unwrap()
+                .data_hash64,
+            dh_a
+        );
     }
 
     #[test]
@@ -431,7 +484,11 @@ mod tests {
         mf.fail_with = Some(OccError::Rpc("Unauthorized".into())); // will be mapped to Unauthorized
 
         let intents = vec![mk_intent_touching(a)];
-        let cfg = OccConfig { max_retries: 3, backoff_ms: 1, ..Default::default() };
+        let cfg = OccConfig {
+            max_retries: 3,
+            backoff_ms: 1,
+            ..Default::default()
+        };
 
         let err = capture_occ_with_retries(&mf, &intents, &cfg).err().unwrap();
         // Early exit; either Unauthorized or Rpc(unauthorized) (we map to Unauthorized).
@@ -448,7 +505,11 @@ mod tests {
         mf.fail_with = Some(OccError::Rpc("request timed out".into()));
 
         let intents = vec![mk_intent_touching(a)];
-        let cfg = OccConfig { max_retries: 2, backoff_ms: 1, ..Default::default() };
+        let cfg = OccConfig {
+            max_retries: 2,
+            backoff_ms: 1,
+            ..Default::default()
+        };
 
         let err = capture_occ_with_retries(&mf, &intents, &cfg).err().unwrap();
         matches!(err, OccError::RetriesExhausted);
@@ -466,7 +527,12 @@ mod tests {
         mf.insert(b, 20, owner, vec![], 1000);
 
         let intents = vec![mk_intent_touching(a), mk_intent_touching(b)];
-        let cfg = OccConfig { max_slot_drift: 10, max_retries: 2, backoff_ms: 1, ..Default::default() };
+        let cfg = OccConfig {
+            max_slot_drift: 10,
+            max_retries: 2,
+            backoff_ms: 1,
+            ..Default::default()
+        };
 
         let err = capture_occ_with_retries(&mf, &intents, &cfg).err().unwrap();
         matches!(err, OccError::SlotDrift { .. });

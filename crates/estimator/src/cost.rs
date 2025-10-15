@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Output of CU safety application.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,13 +12,18 @@ pub struct CuEstimate {
 pub fn apply_safety(cu: u32, slack: u32, pct: u8) -> CuEstimate {
     let pct_add = (cu as u64 * pct as u64) / 100;
     let with = cu.saturating_add(slack).saturating_add(pct_add as u32);
-    CuEstimate { cu, cu_with_safety: with }
+    CuEstimate {
+        cu,
+        cu_with_safety: with,
+    }
 }
 
 /// Same as `apply_safety`, then clamp to a hard cap (e.g., cluster limit).
 pub fn apply_safety_with_cap(cu: u32, slack: u32, pct: u8, cap: u32) -> CuEstimate {
     let mut est = apply_safety(cu, slack, pct);
-    if est.cu_with_safety > cap { est.cu_with_safety = cap; }
+    if est.cu_with_safety > cap {
+        est.cu_with_safety = cap;
+    }
     est
 }
 

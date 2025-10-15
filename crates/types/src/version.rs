@@ -1,6 +1,6 @@
-use serde::{Serialize, Deserialize};
+use crate::hash::{blake3_concat, Hash32};
+use serde::{Deserialize, Serialize};
 use solana_program::pubkey::Pubkey;
-use crate::hash::{Hash32, blake3_concat};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AccountVersion {
@@ -21,7 +21,9 @@ impl Ord for AccountVersion {
     }
 }
 impl PartialOrd for AccountVersion {
-    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) }
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
 }
 
 impl AccountVersion {
@@ -40,33 +42,68 @@ impl AccountVersion {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json;
 
-    fn k() -> Pubkey { Pubkey::new_unique() }
+    fn k() -> Pubkey {
+        Pubkey::new_unique()
+    }
 
     #[test]
     fn digest_changes_when_any_field_changes() {
-        let base = AccountVersion { key: k(), lamports: 1, owner: k(), data_hash64: 42, slot: 10 };
+        let base = AccountVersion {
+            key: k(),
+            lamports: 1,
+            owner: k(),
+            data_hash64: 42,
+            slot: 10,
+        };
         let d0 = base.digest();
 
-        let mut v = base; v.lamports = 2;                 assert_ne!(d0, v.digest());
-        v = base;        v.owner = k();                   assert_ne!(d0, v.digest());
-        v = base;        v.data_hash64 = 43;              assert_ne!(d0, v.digest());
-        v = base;        v.slot = 11;                     assert_ne!(d0, v.digest());
-        v = base;        v.key = k();                     assert_ne!(d0, v.digest());
+        let mut v = base;
+        v.lamports = 2;
+        assert_ne!(d0, v.digest());
+        v = base;
+        v.owner = k();
+        assert_ne!(d0, v.digest());
+        v = base;
+        v.data_hash64 = 43;
+        assert_ne!(d0, v.digest());
+        v = base;
+        v.slot = 11;
+        assert_ne!(d0, v.digest());
+        v = base;
+        v.key = k();
+        assert_ne!(d0, v.digest());
     }
 
     #[test]
     fn ord_sorts_by_key_then_slot() {
-        let key = k(); let owner = k();
-        let a = AccountVersion { key, lamports: 0, owner, data_hash64: 0, slot: 5 };
-        let b = AccountVersion { key, lamports: 0, owner, data_hash64: 0, slot: 7 };
-        let c = AccountVersion { key: k(), lamports: 0, owner, data_hash64: 0, slot: 1 };
+        let key = k();
+        let owner = k();
+        let a = AccountVersion {
+            key,
+            lamports: 0,
+            owner,
+            data_hash64: 0,
+            slot: 5,
+        };
+        let b = AccountVersion {
+            key,
+            lamports: 0,
+            owner,
+            data_hash64: 0,
+            slot: 7,
+        };
+        let c = AccountVersion {
+            key: k(),
+            lamports: 0,
+            owner,
+            data_hash64: 0,
+            slot: 1,
+        };
         let mut v = vec![b, c, a];
         v.sort();
         let same_key: Vec<_> = v.iter().filter(|x| x.key == key).cloned().collect();
@@ -76,7 +113,13 @@ mod tests {
 
     #[test]
     fn serde_json_uses_base58_pubkeys_and_roundtrips() {
-        let v = AccountVersion { key: k(), lamports: 3, owner: k(), data_hash64: 9, slot: 77 };
+        let v = AccountVersion {
+            key: k(),
+            lamports: 3,
+            owner: k(),
+            data_hash64: 9,
+            slot: 77,
+        };
         let j = serde_json::to_string(&v).unwrap();
         assert!(j.contains(&format!("\"{}\"", v.key.to_string())));
         assert!(j.contains(&format!("\"{}\"", v.owner.to_string())));

@@ -33,7 +33,10 @@ struct DriftStats {
 }
 impl DriftStats {
     fn new(cap: usize) -> Self {
-        Self { window: Vec::with_capacity(cap), cap }
+        Self {
+            window: Vec::with_capacity(cap),
+            cap,
+        }
     }
     fn record(&mut self, ok: bool) {
         if self.window.len() == self.cap {

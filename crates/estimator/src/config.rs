@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyMargins {
@@ -20,11 +20,18 @@ impl SafetyMargins {
     /// is 1232 - (shortvec(num_sigs) + 64*num_sigs) - bytes_slack. :contentReference[oaicite:0]{index=0}
     pub fn max_message_bytes_with_signers(&self, num_signers: usize) -> usize {
         const PACKET_DATA_SIZE: usize = 1232;
-        fn shortvec_len(n: usize) -> usize { if n < 128 { 1 } else if n < 16384 { 2 } else { 3 } }
+        fn shortvec_len(n: usize) -> usize {
+            if n < 128 {
+                1
+            } else if n < 16384 {
+                2
+            } else {
+                3
+            }
+        }
         let sig_bytes = 64usize * num_signers + shortvec_len(num_signers);
         let hard = PACKET_DATA_SIZE.saturating_sub(sig_bytes);
-        hard
-            .min(self.max_msg_bytes as usize)
+        hard.min(self.max_msg_bytes as usize)
             .saturating_sub(self.bytes_slack as usize)
     }
 }
@@ -40,8 +47,6 @@ impl Default for SafetyMargins {
         }
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -66,7 +71,13 @@ mod tests {
     fn constant_aligned_with_packet_limit() {
         let s = SafetyMargins::default();
         let n = 1usize;
-        let shortvec = if n < 128 { 1 } else if n < 16384 { 2 } else { 3 };
+        let shortvec = if n < 128 {
+            1
+        } else if n < 16384 {
+            2
+        } else {
+            3
+        };
         let expected_upper = 1232usize.saturating_sub(64 * n + shortvec);
         assert!(s.max_message_bytes_with_signers(n) <= expected_upper);
     }

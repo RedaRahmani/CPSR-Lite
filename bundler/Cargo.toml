@@ -37,3 +37,12 @@ clap = { version = "4.5", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+url = "2"
+bs58 = "0.4"
+base64 = "0.21"
+async-trait = "0.1"
+
+[dev-dependencies]
+wiremock = "0.6"
+chrono = { version = "0.4", features = ["clock"] }

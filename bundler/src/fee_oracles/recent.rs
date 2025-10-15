@@ -1,8 +1,8 @@
 //! A percentile + EMA fee oracle built on `getRecentPrioritizationFees`.
 //! See docs in the file header of your previous version; logic unchanged.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_response::RpcPrioritizationFee;
@@ -21,22 +21,22 @@ pub fn get_recent_fees_count() -> u64 {
 #[derive(Clone)]
 pub struct RecentFeesOracle {
     pub rpc: Arc<RpcClient>,
-    pub probe_accounts: Vec<Pubkey>,   // Accounts to probe; can be empty.
-    pub max_cu_limit: u64,             // e.g., 1_400_000
-    pub min_cu_price: u64,             // μLam/CU floor (e.g., 100)
-    pub max_cu_price: u64,             // μLam/CU ceiling
-    pub p_primary: f64,                // primary percentile (e.g., 0.75)
-    pub p_fallback: f64,               // fallback percentile (e.g., 0.90)
-    pub ema_alpha: f64,                // EMA smoothing factor (e.g., 0.20)
-    pub hysteresis_bps: u64,           // ignore reprices below this threshold (e.g., 300 = 3%)
+    pub probe_accounts: Vec<Pubkey>, // Accounts to probe; can be empty.
+    pub max_cu_limit: u64,           // e.g., 1_400_000
+    pub min_cu_price: u64,           // μLam/CU floor (e.g., 100)
+    pub max_cu_price: u64,           // μLam/CU ceiling
+    pub p_primary: f64,              // primary percentile (e.g., 0.75)
+    pub p_fallback: f64,             // fallback percentile (e.g., 0.90)
+    pub ema_alpha: f64,              // EMA smoothing factor (e.g., 0.20)
+    pub hysteresis_bps: u64,         // ignore reprices below this threshold (e.g., 300 = 3%)
     // state
     state: Arc<Mutex<OracleState>>,
 }
 
 #[derive(Default, Debug, Clone)]
 struct OracleState {
-    ema_price: Option<f64>,      // EMA over μLam/CU
-    last_output: Option<u64>,    // last suggested μLam/CU (post clamp)
+    ema_price: Option<f64>,   // EMA over μLam/CU
+    last_output: Option<u64>, // last suggested μLam/CU (post clamp)
 }
 
 impl RecentFeesOracle {
@@ -45,12 +45,12 @@ impl RecentFeesOracle {
             rpc,
             probe_accounts,
             max_cu_limit: 1_400_000,
-            min_cu_price: 100,      // non-zero default floor (configurable)
+            min_cu_price: 100, // non-zero default floor (configurable)
             max_cu_price: 5_000,
             p_primary: 0.75,
             p_fallback: 0.90,
             ema_alpha: 0.20,
-            hysteresis_bps: 300,    // 3%
+            hysteresis_bps: 300, // 3%
             state: Arc::new(Mutex::new(OracleState::default())),
         }
     }
@@ -58,11 +58,18 @@ impl RecentFeesOracle {
     fn fetch_fees(&self) -> Vec<u64> {
         // If probe_accounts is empty, RPC returns recent fees anyway.
         track_get_recent_prioritization_fees();
-        match self.rpc.get_recent_prioritization_fees(&self.probe_accounts) {
+        match self
+            .rpc
+            .get_recent_prioritization_fees(&self.probe_accounts)
+        {
             Ok(list) if !list.is_empty() => {
                 RPC_GET_RECENT_FEES_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
                 list.into_iter()
-                    .map(|RpcPrioritizationFee { prioritization_fee, .. }| prioritization_fee as u64)
+                    .map(
+                        |RpcPrioritizationFee {
+                             prioritization_fee, ..
+                         }| prioritization_fee as u64,
+                    )
                     .collect()
             }
             _ => vec![],
@@ -71,7 +78,9 @@ impl RecentFeesOracle {
 
     #[inline]
     fn pct(sorted: &[u64], p: f64) -> Option<u64> {
-        if sorted.is_empty() { return None; }
+        if sorted.is_empty() {
+            return None;
+        }
         let n = sorted.len();
         let idx = ((p.clamp(0.0, 1.0) * (n as f64 - 1.0)).ceil() as usize).min(n - 1);
         Some(sorted[idx])
@@ -99,7 +108,9 @@ impl RecentFeesOracle {
         };
         st.ema_price = Some(ema);
 
-        let candidate = ema.round().clamp(self.min_cu_price as f64, self.max_cu_price as f64) as u64;
+        let candidate =
+            ema.round()
+                .clamp(self.min_cu_price as f64, self.max_cu_price as f64) as u64;
         match st.last_output {
             None => {
                 st.last_output = Some(candidate);
@@ -108,7 +119,11 @@ impl RecentFeesOracle {
             Some(last) => {
                 let bigger = candidate.max(last);
                 let smaller = candidate.min(last);
-                let delta_bps = if bigger == 0 { 0 } else { ((bigger - smaller) * 10_000) / bigger };
+                let delta_bps = if bigger == 0 {
+                    0
+                } else {
+                    ((bigger - smaller) * 10_000) / bigger
+                };
                 if delta_bps < self.hysteresis_bps {
                     last
                 } else {
@@ -150,7 +165,7 @@ mod tests {
 
     #[test]
     fn percentile_indexing_is_conservative() {
-        let o = RecentFeesOracle::new(Arc::new(RpcClient::new_mock("".into())), vec![]);
+        let o = RecentFeesOracle::new(Arc::new(RpcClient::new_mock("")), vec![]);
         let mut d = vec![1u64, 2, 3, 10, 20, 100];
         d.sort_unstable();
         assert_eq!(RecentFeesOracle::pct(&d, 0.75).unwrap(), 20);

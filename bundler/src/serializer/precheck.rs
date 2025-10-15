@@ -15,7 +15,11 @@ pub fn validate_alt_resolution(alts: &AltResolution) -> Result<()> {
         let mut set = std::collections::BTreeSet::new();
         for pk in &t.addresses {
             if !set.insert(*pk) {
-                return Err(anyhow!("ALT table {} contains duplicate address {}", t.key, pk));
+                return Err(anyhow!(
+                    "ALT table {} contains duplicate address {}",
+                    t.key,
+                    pk
+                ));
             }
         }
     }
@@ -26,7 +30,9 @@ pub fn validate_alt_resolution(alts: &AltResolution) -> Result<()> {
 /// that can't be satisfied at build-time. Keeping the API here so callers can wire
 /// it if/when needed.
 #[allow(dead_code)]
-pub fn prune_empty_tables(mut tables: Vec<AddressLookupTableAccount>) -> Vec<AddressLookupTableAccount> {
+pub fn prune_empty_tables(
+    mut tables: Vec<AddressLookupTableAccount>,
+) -> Vec<AddressLookupTableAccount> {
     tables.retain(|t| !t.addresses.is_empty());
     tables
 }

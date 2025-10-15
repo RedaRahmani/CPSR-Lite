@@ -40,10 +40,10 @@ pub struct TxBudget {
 impl Default for TxBudget {
     fn default() -> Self {
         Self {
-            max_bytes: 1200,              // caller should refine using estimator::SafetyMargins helper
-            byte_slack: 64,               // cushion
-            max_unique_accounts: 48,      // practical ceiling
-            max_instructions: 30,         // way below shortvec bump
+            max_bytes: 1200,         // caller should refine using estimator::SafetyMargins helper
+            byte_slack: 64,          // cushion
+            max_unique_accounts: 48, // practical ceiling
+            max_instructions: 30,    // way below shortvec bump
             max_cu: 1_200_000,
             default_cu_per_intent: 25_000,
         }
@@ -99,7 +99,16 @@ impl BudgetOracle for ProgramAwareOracle {
     #[inline]
     fn instr_bytes(&self, ix: &Instruction) -> usize {
         // compiled instruction: program idx(1) + sv(accs) + accs + sv(data) + data
-        #[inline] fn sv(n: usize) -> usize { if n < 128 { 1 } else if n < 16384 { 2 } else { 3 } }
+        #[inline]
+        fn sv(n: usize) -> usize {
+            if n < 128 {
+                1
+            } else if n < 16384 {
+                2
+            } else {
+                3
+            }
+        }
         let accs = ix.accounts.len();
         let data = ix.data.len();
         1 + sv(accs) + accs + sv(data) + data
@@ -128,13 +137,24 @@ pub struct BasicOracle;
 impl BudgetOracle for BasicOracle {
     #[inline]
     fn instr_bytes(&self, ix: &Instruction) -> usize {
-        #[inline] fn sv(n: usize) -> usize { if n < 128 { 1 } else if n < 16384 { 2 } else { 3 } }
+        #[inline]
+        fn sv(n: usize) -> usize {
+            if n < 128 {
+                1
+            } else if n < 16384 {
+                2
+            } else {
+                3
+            }
+        }
         let accs = ix.accounts.len();
         let data = ix.data.len();
         1 + sv(accs) + accs + sv(data) + data
     }
     #[inline]
-    fn cu_for_intent(&self, _intent: &UserIntent) -> u64 { 0 }
+    fn cu_for_intent(&self, _intent: &UserIntent) -> u64 {
+        0
+    }
 }
 
 // ---------- Errors ----------
@@ -219,7 +239,13 @@ const BASE_MESSAGE_OVERHEAD: usize = 3 + 32;
 
 #[inline]
 fn shortvec_len(n: usize) -> usize {
-    if n < 128 { 1 } else if n < 16384 { 2 } else { 3 }
+    if n < 128 {
+        1
+    } else if n < 16384 {
+        2
+    } else {
+        3
+    }
 }
 
 #[inline]
@@ -234,9 +260,9 @@ struct KeyMeta {
 }
 
 struct IntentFootprint {
-    keys: Vec<KeyMeta>,    // program + metas (ordered)
-    instr_bytes: usize,    // compiled instruction bytes
-    intent_cu: u64,        // CU estimate
+    keys: Vec<KeyMeta>, // program + metas (ordered)
+    instr_bytes: usize, // compiled instruction bytes
+    intent_cu: u64,     // CU estimate
 }
 
 impl IntentFootprint {
@@ -244,29 +270,47 @@ impl IntentFootprint {
         let ix = &intent.ix;
 
         let mut keys = Vec::with_capacity(ix.accounts.len() + 1);
-        keys.push(KeyMeta { pubkey: ix.program_id, writable: false });
+        keys.push(KeyMeta {
+            pubkey: ix.program_id,
+            writable: false,
+        });
         for m in &ix.accounts {
-            keys.push(KeyMeta { pubkey: m.pubkey, writable: m.is_writable });
+            keys.push(KeyMeta {
+                pubkey: m.pubkey,
+                writable: m.is_writable,
+            });
         }
 
         let mut cu = oracle.cu_for_intent(intent);
-        if cu == 0 { cu = budget.default_cu_per_intent; }
+        if cu == 0 {
+            cu = budget.default_cu_per_intent;
+        }
 
-        Self { keys, instr_bytes: oracle.instr_bytes(ix), intent_cu: cu }
+        Self {
+            keys,
+            instr_bytes: oracle.instr_bytes(ix),
+            intent_cu: cu,
+        }
     }
 
     #[inline]
     fn message_unique_len(&self, alt: &AltPolicy) -> usize {
-        if !alt.enabled { return self.keys.len(); }
+        if !alt.enabled {
+            return self.keys.len();
+        }
         self.keys.len().min(alt.reserve_message_keys)
     }
     #[inline]
     fn alt_unique_len(&self, alt: &AltPolicy) -> usize {
-        if !alt.enabled { return 0; }
+        if !alt.enabled {
+            return 0;
+        }
         self.keys.len().saturating_sub(alt.reserve_message_keys)
     }
     #[inline]
-    fn cu_estimate(&self, _budget: &TxBudget) -> u64 { self.intent_cu }
+    fn cu_estimate(&self, _budget: &TxBudget) -> u64 {
+        self.intent_cu
+    }
 
     /// Bytes contributed *by this intent only*:
     /// - static keys (32B each) kept in message table
@@ -291,7 +335,11 @@ fn size_if_only_this(fp: &IntentFootprint, budget: &TxBudget, alt: &AltPolicy) -
     let sv_keys = shortvec_len(msg_uniq);
     let sv_instrs = shortvec_len(1);
     // lookups vector always present in v0; 0 → 1 byte, else grows as needed
-    let table_count = if alt.enabled && alt_uniq > 0 { alt.table_count_estimate } else { 0 };
+    let table_count = if alt.enabled && alt_uniq > 0 {
+        alt.table_count_estimate
+    } else {
+        0
+    };
     let sv_lookups = shortvec_len(table_count);
 
     BASE_MESSAGE_OVERHEAD
@@ -300,7 +348,11 @@ fn size_if_only_this(fp: &IntentFootprint, budget: &TxBudget, alt: &AltPolicy) -
         + sv_lookups
         + sv_instrs
         + fp.self_bytes(alt)
-        + if table_count > 0 { table_count * alt.per_table_fixed_bytes } else { 0 }
+        + if table_count > 0 {
+            table_count * alt.per_table_fixed_bytes
+        } else {
+            0
+        }
 }
 
 fn fits_in_empty(fp: &IntentFootprint, budget: &TxBudget, alt: &AltPolicy) -> bool {
@@ -348,7 +400,8 @@ impl<'a> ChunkAccumulator<'a> {
             cu: 0,
             instrs: 0,
             alt_used: false,
-            budget, alt,
+            budget,
+            alt,
         }
     }
 
@@ -376,12 +429,17 @@ impl<'a> ChunkAccumulator<'a> {
 
         for meta in &fp.keys {
             let key = meta.pubkey;
-            if self.message_keys.contains(&key) || self.alt_keys.contains(&key) { continue; }
+            if self.message_keys.contains(&key) || self.alt_keys.contains(&key) {
+                continue;
+            }
 
             if self.alt.enabled {
                 let used_in_msg = self.message_keys.len().min(self.alt.reserve_message_keys);
-                if used_in_msg < self.alt.reserve_message_keys { new_message_keys += 1; }
-                else { new_alt_keys += 1; }
+                if used_in_msg < self.alt.reserve_message_keys {
+                    new_message_keys += 1;
+                } else {
+                    new_alt_keys += 1;
+                }
             } else {
                 new_message_keys += 1;
             }
@@ -411,7 +469,13 @@ impl<'a> ChunkAccumulator<'a> {
         let add_instrs = 1usize;
         let add_cu = fp.cu_estimate(self.budget);
 
-        (add_bytes, new_message_keys + new_alt_keys, add_instrs, add_cu, alt_will_be_used)
+        (
+            add_bytes,
+            new_message_keys + new_alt_keys,
+            add_instrs,
+            add_cu,
+            alt_will_be_used,
+        )
     }
 
     fn can_add(&self, fp: &IntentFootprint) -> bool {
@@ -422,13 +486,25 @@ impl<'a> ChunkAccumulator<'a> {
             let mut new_alt = 0usize;
             for meta in &fp.keys {
                 let key = meta.pubkey;
-                if self.message_keys.contains(&key) || self.alt_keys.contains(&key) { continue; }
+                if self.message_keys.contains(&key) || self.alt_keys.contains(&key) {
+                    continue;
+                }
                 let used = self.message_keys.len().min(self.alt.reserve_message_keys);
-                if used < self.alt.reserve_message_keys { new_msg += 1; } else { new_alt += 1; }
+                if used < self.alt.reserve_message_keys {
+                    new_msg += 1;
+                } else {
+                    new_alt += 1;
+                }
             }
-            (self.message_keys.len() + new_msg, self.alt_keys.len() + new_alt)
+            (
+                self.message_keys.len() + new_msg,
+                self.alt_keys.len() + new_alt,
+            )
         } else {
-            (self.message_keys.len() + add_unique_total, self.alt_keys.len())
+            (
+                self.message_keys.len() + add_unique_total,
+                self.alt_keys.len(),
+            )
         };
 
         (self.bytes + add_bytes) <= self.budget.max_bytes
@@ -441,11 +517,17 @@ impl<'a> ChunkAccumulator<'a> {
     fn add(&mut self, nid: NodeId, fp: &IntentFootprint) {
         for meta in &fp.keys {
             let key = meta.pubkey;
-            if self.message_keys.contains(&key) || self.alt_keys.contains(&key) { continue; }
+            if self.message_keys.contains(&key) || self.alt_keys.contains(&key) {
+                continue;
+            }
             let used = self.message_keys.len().min(self.alt.reserve_message_keys);
             if self.alt.enabled && used >= self.alt.reserve_message_keys {
                 self.alt_keys.insert(key);
-                if meta.writable { self.alt_wr_keys.insert(key); } else { self.alt_ro_keys.insert(key); }
+                if meta.writable {
+                    self.alt_wr_keys.insert(key);
+                } else {
+                    self.alt_ro_keys.insert(key);
+                }
             } else {
                 self.message_keys.insert(key);
             }
@@ -454,7 +536,9 @@ impl<'a> ChunkAccumulator<'a> {
         self.bytes = self.bytes.saturating_add(add_bytes);
         self.instrs = self.instrs.saturating_add(add_instrs);
         self.cu = self.cu.saturating_add(add_cu);
-        if alt_first { self.alt_used = true; }
+        if alt_first {
+            self.alt_used = true;
+        }
         self.nodes.push(nid);
     }
 
@@ -476,8 +560,15 @@ mod more_chunk_tests {
 
     fn mk_intent(keys: &[Pubkey], data_len: usize) -> UserIntent {
         let program_id = keys[0];
-        let accounts = keys[1..].iter().map(|k| AccountMeta::new(*k, false)).collect::<Vec<_>>();
-        let ix = Instruction { program_id, accounts, data: vec![0u8; data_len] };
+        let accounts = keys[1..]
+            .iter()
+            .map(|k| AccountMeta::new(*k, false))
+            .collect::<Vec<_>>();
+        let ix = Instruction {
+            program_id,
+            accounts,
+            data: vec![0u8; data_len],
+        };
         UserIntent::new(Pubkey::new_unique(), ix, 0, None)
     }
 
@@ -503,7 +594,11 @@ mod more_chunk_tests {
     fn splits_on_cu_limit() {
         let p = Pubkey::new_unique();
         let a = Pubkey::new_unique();
-        let intents = vec![mk_intent(&[p, a], 8), mk_intent(&[p, a], 8), mk_intent(&[p, a], 8)];
+        let intents = vec![
+            mk_intent(&[p, a], 8),
+            mk_intent(&[p, a], 8),
+            mk_intent(&[p, a], 8),
+        ];
         let layer: Vec<NodeId> = vec![0, 1, 2];
 
         let mut budget = TxBudget::default();

@@ -80,6 +80,10 @@ This project is currently in development. We're building:
 - **For Protocols**: White-label bundling solutions
 - **For Users**: Seamless DeFi experiences through partner applications
 
+### Ephemeral Rollups & Compact Settlement
+
+CPSR-Lite taps [MagicBlock's Ephemeral Rollups](https://docs.magicblock.gg/) to execute intents off-chain and only anchor a compact settlement transaction on Solana. Enable the ER path with `--er-enabled` (optionally `--er-endpoint` or router discovery) to bundle compute-heavy intent flows into a single, low-cost settlement proof.
+
 ---
 
 **Why Now?**

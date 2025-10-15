@@ -6,3 +6,8 @@ node_modules
 test-ledger
 .yarn
 build
+wiretap
+CONTRIBUTING.md
+er_run_report.json
+cpsr_run.json
+er_wiretap
