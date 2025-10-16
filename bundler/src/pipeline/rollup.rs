@@ -934,7 +934,9 @@ where
             let below_cu = threshold > 0 && plan.estimates.est_cu < threshold;
             let small_message = plan.estimates.est_msg_bytes <= ER_SMALL_MESSAGE_BYTES;
             if below_cu || small_message {
-                let reason = if below_cu {
+                let reason = if below_cu && small_message {
+                    "below_threshold+small_message"
+                } else if below_cu {
                     "below_threshold"
                 } else {
                     "small_message"

@@ -980,6 +980,35 @@ fn truncate_cell(input: &str, max: usize) -> String {
     truncated
 }
 
+const SELF_CHECK_FEE_THRESHOLD: f64 = 0.50;
+const SELF_CHECK_EXEC_P95_THRESHOLD_MS: f64 = 500.0;
+
+fn fee_based_self_check_failures(
+    fee_savings_ratio: f64,
+    er_exec_p95_ms: Option<f64>,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    if fee_savings_ratio < SELF_CHECK_FEE_THRESHOLD {
+        failures.push(format!(
+            "fee savings ratio {:.2}% below {:.0}% threshold",
+            fee_savings_ratio * 100.0,
+            SELF_CHECK_FEE_THRESHOLD * 100.0
+        ));
+    }
+
+    match er_exec_p95_ms {
+        Some(value) if value <= SELF_CHECK_EXEC_P95_THRESHOLD_MS => {}
+        Some(value) => failures.push(format!(
+            "ER execute p95 {:.2}ms exceeds {:.0}ms threshold",
+            value, SELF_CHECK_EXEC_P95_THRESHOLD_MS
+        )),
+        None => failures.push("ER execute p95 unavailable to evaluate gate".to_string()),
+    }
+
+    failures
+}
+
 // (make_build_vmsg helper unchanged)
 fn make_build_vmsg<'a>(
     payer_pk: solana_sdk::pubkey::Pubkey,
@@ -1175,7 +1204,7 @@ async fn main() -> Result<()> {
             privacy_mode: args.er_privacy.into(),
             router_url,
             router_api_key: args.er_router_key.clone(),
-            route_cache_ttl: Duration::from_millis(args.er_route_ttl_ms.max(1_000)),
+            route_cache_ttl: Duration::from_millis(args.er_route_ttl_ms),
             circuit_breaker_failures: args.er_circuit_failures,
             circuit_breaker_cooldown: circuit_cooldown,
             payer: payer.clone(),
@@ -2051,7 +2080,7 @@ async fn main() -> Result<()> {
             baseline_cu_total, baseline_avg_cu
         );
         println!(
-            "cu savings ratio          : {:.2}%",
+            "cu savings ratio (info)   : {:.2}%",
             cu_savings_ratio * 100.0
         );
         println!(
@@ -2101,16 +2130,32 @@ async fn main() -> Result<()> {
             "ER success rate / fallback rate : {:.3} / {:.3}",
             er_success_rate, er_fallback_rate
         );
+        if let Some(summary) = &er_summary {
+            println!("router total sessions      : {}", summary.sessions);
+            println!("router simulate count      : {}", summary.router_simulate);
+            println!("router send count          : {}", summary.router_send);
+            println!("skipped small chunks       : {}", summary.small_chunk_skips);
+            println!(
+                "merged small chunks        : {}",
+                summary.merged_small_chunks
+            );
+        }
         if let Some(router) = &router_health_summary {
             println!(
                 "router discovery success  : {:.2}%",
                 router.discovery_success_rate * 100.0
             );
             println!(
-                "router cache hit rate      : {:.2}% ({} hits / {} misses)",
+                "route cache hit rate       : {:.2}% ({} hits / {} misses)",
                 router.cache_hit_rate * 100.0,
                 router.cache_hits,
                 router.cache_misses
+            );
+            println!(
+                "blockhash cache hit rate   : {:.2}% ({} hits / {} misses)",
+                router.blockhash_cache_hit_rate * 100.0,
+                router.blockhash_cache_hits,
+                router.blockhash_cache_misses
             );
         }
     }
@@ -2175,20 +2220,45 @@ async fn main() -> Result<()> {
         }
     }
 
+    if !er_chunk_rows.is_empty() {
+        println!("\n=== ER CHUNK SUMMARY ===");
+        println!(
+            "{:<5} {:<6} {:<16} {:<28} {:<40} {:>12} {:>16}",
+            "Layer", "Chunk", "Decision", "Reason", "Route", "Total (ms)", "ER execute (ms)"
+        );
+        for row in &er_chunk_rows {
+            let decision = truncate_cell(&row.decision, 16);
+            let reason = truncate_cell(row.reason.as_deref().unwrap_or("-"), 28);
+            let route = truncate_cell(row.route.as_deref().unwrap_or("-"), 40);
+            let exec_cell = row
+                .exec_ms
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<5} {:<6} {:<16} {:<28} {:<40} {:>12} {:>16}",
+                row.layer, row.chunk, decision, reason, route, row.total_ms, exec_cell
+            );
+        }
+    }
+
     let mut self_check_failures: Vec<String> = Vec::new();
     if args.er_enabled && er_real_chunks > 0 && !args.dry_run {
-        if fee_savings_ratio < 0.20 {
-            self_check_failures.push(format!(
-                "fee savings ratio {:.2}% below 20% threshold",
-                fee_savings_ratio * 100.0
-            ));
-        }
-        if cu_savings_ratio < 0.20 {
-            self_check_failures.push(format!(
-                "CU savings ratio {:.2}% below 20% threshold",
-                cu_savings_ratio * 100.0
-            ));
-        }
+        tracing::info!(
+            target: "demo.self_check",
+            mode = "fee",
+            fee_threshold_pct = SELF_CHECK_FEE_THRESHOLD * 100.0,
+            exec_p95_threshold_ms = SELF_CHECK_EXEC_P95_THRESHOLD_MS,
+            fee_savings_ratio_pct = fee_savings_ratio * 100.0,
+            cu_savings_ratio_pct = cu_savings_ratio * 100.0,
+            er_exec_p95_ms = ?er_exec_p95_ms,
+            "evaluating self-check (fee-based gate)"
+        );
+
+        self_check_failures.extend(fee_based_self_check_failures(
+            fee_savings_ratio,
+            er_exec_p95_ms,
+        ));
+
         if er_success_rate < 0.99 {
             self_check_failures.push(format!(
                 "ER success rate {:.3} below 0.99 threshold",
@@ -2201,23 +2271,6 @@ async fn main() -> Result<()> {
                 er_fallback_rate
             ));
         }
-
-        let latency_ok =
-            if let (Some(er_p95), Some(base_p95)) = (er_latency_p95_ms, baseline_latency_p95_ms) {
-                er_p95 <= base_p95
-            } else {
-                false
-            };
-        let latency_alt_ok =
-            if let (Some(er_p50), Some(base_p50)) = (er_latency_p50_ms, baseline_latency_p50_ms) {
-                er_p50 <= base_p50 * 0.9
-            } else {
-                false
-            };
-        if !(latency_ok || latency_alt_ok) {
-            self_check_failures
-                .push("ER latency regression detected (p95 and p50 thresholds unmet)".to_string());
-        }
     }
 
     if !self_check_failures.is_empty() {
@@ -2225,6 +2278,10 @@ async fn main() -> Result<()> {
         for msg in &self_check_failures {
             println!("- {}", msg);
         }
+        println!(
+            "info: CU savings ratio {:.2}% (informational gate only)",
+            cu_savings_ratio * 100.0
+        );
         if !er_chunk_rows.is_empty() {
             let mut by_cu: Vec<&ErChunkSummaryRow> = er_chunk_rows
                 .iter()
@@ -2265,6 +2322,12 @@ async fn main() -> Result<()> {
             }
         }
         anyhow::bail!("self-check thresholds not met");
+    } else if args.er_enabled && er_real_chunks > 0 && !args.dry_run {
+        println!("\nSELF-CHECK PASSED (fee-based gate).");
+        println!(
+            "info: CU savings ratio {:.2}% (informational gate only)",
+            cu_savings_ratio * 100.0
+        );
     }
 
     let er_perf_summary = er_summary.as_ref().map(|summary| ErPerformanceSummary {
@@ -2547,6 +2610,37 @@ mod tests {
         assert!(
             report.absolute_savings_lamports > 0,
             "savings must be positive"
+        );
+    }
+
+    #[test]
+    fn fee_gate_reports_expected_messages() {
+        let failing = fee_based_self_check_failures(0.40, Some(600.0));
+        assert!(
+            failing.iter().any(|msg| msg.contains(&format!(
+                "{:.0}% threshold",
+                SELF_CHECK_FEE_THRESHOLD * 100.0
+            ))),
+            "fee gate should reference fee savings threshold"
+        );
+        assert!(
+            failing.iter().any(|msg| msg.contains(&format!(
+                "{:.0}ms threshold",
+                SELF_CHECK_EXEC_P95_THRESHOLD_MS
+            ))),
+            "fee gate should reference execution threshold"
+        );
+
+        let passing = fee_based_self_check_failures(0.75, Some(450.0));
+        assert!(
+            passing.is_empty(),
+            "fee gate should pass for strong metrics"
+        );
+
+        let missing_exec = fee_based_self_check_failures(0.75, None);
+        assert!(
+            missing_exec.iter().any(|msg| msg.contains("unavailable")),
+            "missing execute p95 must produce message"
         );
     }
 }

@@ -787,7 +787,7 @@ impl ErHttpClientInner {
 
     async fn resolve_route(&self) -> Result<ErRouteInfo> {
         if let Some(override_url) = &self.cfg.endpoint_override {
-            let ttl = self.cfg.route_cache_ttl.max(Duration::from_millis(100));
+            let ttl = self.cfg.route_cache_ttl;
             return Ok(ErRouteInfo {
                 endpoint: override_url.clone(),
                 ttl,
@@ -948,8 +948,8 @@ impl ErHttpClientInner {
 
         let ttl = chosen
             .ttl_duration()
-            .unwrap_or(self.cfg.route_cache_ttl)
-            .max(Duration::from_millis(100));
+            .map(|router_ttl| router_ttl.min(self.cfg.route_cache_ttl))
+            .unwrap_or(self.cfg.route_cache_ttl);
 
         info!(
             target: "er",
@@ -1236,119 +1236,88 @@ impl ErClient for ErHttpClientInner {
     async fn execute(&self, session: &ErSession, intents: &[UserIntent]) -> Result<ErOutput> {
         let exec_start = Instant::now();
         let telemetry = self.telemetry.clone();
-        let instructions = intents_to_instructions(intents).map_err(|err| {
-            if let Some(tel) = &telemetry {
-                tel.record_execute(Some(exec_start.elapsed()), false);
-            }
-            err
-        })?;
 
-        // 0) Fresh blockhash + build+sign
-        let recent_blockhash =
-            self.get_latest_blockhash(&session.endpoint)
+        let result: Result<ErOutput> = {
+            let instructions = intents_to_instructions(intents)
+                .context("failed to convert intents into instructions")?;
+
+            let recent_blockhash = self
+                .get_latest_blockhash(&session.endpoint)
                 .await
-                .map_err(|err| {
-                    if let Some(tel) = &telemetry {
-                        tel.record_execute(Some(exec_start.elapsed()), false);
-                    }
-                    err
-                })?;
-        let base64_tx =
-            build_and_sign_base64(&instructions, self.cfg.payer.as_ref(), recent_blockhash)
-                .map_err(|err| {
-                    if let Some(tel) = &telemetry {
-                        tel.record_execute(Some(exec_start.elapsed()), false);
-                    }
-                    err
-                })?;
-        let api_key = self.data_plane_api_key_header();
+                .context("fetching latest blockhash for ER execute")?;
 
-        // 1) simulateTransaction (preflight)
-        let sim_request_id = next_router_request_id();
-        let sim_ctx = rpc_context("simulateTransaction", &session.endpoint, sim_request_id);
-        let sim_body = serde_json::json!({
-            "jsonrpc":"2.0","id":sim_request_id,"method":"simulateTransaction",
-            "params":[ base64_tx.clone(), {
-                "encoding":"base64",
-                "replaceRecentBlockhash": false,
-                "sigVerify": true,
-                "commitment": "processed"
-            }]
-        });
-        let sim = self.post_json(&session.endpoint, &sim_body, api_key).await;
-        let sim = match sim {
-            Ok(resp) => resp,
-            Err(err) => {
-                if let Some(tel) = &telemetry {
-                    tel.record_execute(Some(exec_start.elapsed()), false);
-                }
-                return Err(err).with_context(|| sim_ctx.clone());
+            let base64_tx =
+                build_and_sign_base64(&instructions, self.cfg.payer.as_ref(), recent_blockhash)
+                    .context("building and signing ER transaction")?;
+            let api_key = self.data_plane_api_key_header();
+
+            let sim_request_id = next_router_request_id();
+            let sim_ctx = rpc_context("simulateTransaction", &session.endpoint, sim_request_id);
+            let sim_body = serde_json::json!({
+                "jsonrpc":"2.0","id":sim_request_id,"method":"simulateTransaction",
+                "params":[ base64_tx.clone(), {
+                    "encoding":"base64",
+                    "replaceRecentBlockhash": false,
+                    "sigVerify": true,
+                    "commitment": "processed"
+                }]
+            });
+            let sim = self
+                .post_json(&session.endpoint, &sim_body, api_key)
+                .await
+                .with_context(|| sim_ctx.clone())?;
+            ensure_simulation_success(&sim.value).with_context(|| sim_ctx.clone())?;
+            if let Some(tel) = &telemetry {
+                tel.record_router_usage(true, false);
             }
+
+            let send_request_id = next_router_request_id();
+            let send_ctx = rpc_context("sendTransaction", &session.endpoint, send_request_id);
+            let send_body = serde_json::json!({
+                "jsonrpc":"2.0","id":send_request_id,"method":"sendTransaction",
+                "params":[ base64_tx, {
+                    "encoding":"base64",
+                    "skipPreflight": true,
+                    "preflightCommitment":"processed"
+                }]
+            });
+            let send_start = Instant::now();
+            let send = self
+                .post_json(&session.endpoint, &send_body, api_key)
+                .await
+                .with_context(|| send_ctx.clone())?;
+            let exec_duration = send_start.elapsed();
+
+            if let Some(err) = send.value.get("error") {
+                Err(anyhow!("sendTransaction RPC error: {err}"))
+                    .with_context(|| send_ctx.clone())?;
+            }
+
+            let _signature = send
+                .value
+                .get("result")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("sendTransaction missing string result"))
+                .with_context(|| send_ctx.clone())?;
+
+            if let Some(tel) = &telemetry {
+                tel.record_router_usage(false, true);
+            }
+
+            Ok(ErOutput {
+                settlement_instructions: instructions,
+                settlement_accounts: Vec::new(),
+                plan_fingerprint: Some(compute_plan_fingerprint(intents)),
+                exec_duration,
+                blockhash_plan: None,
+            })
         };
-        if let Some(tel) = &telemetry {
-            tel.record_router_usage(true, false);
-        }
-        if let Err(err) = ensure_simulation_success(&sim.value) {
-            if let Some(tel) = &telemetry {
-                tel.record_execute(Some(exec_start.elapsed()), false);
-            }
-            return Err(err).with_context(|| sim_ctx.clone());
-        }
-
-        // 2) sendTransaction
-        let send_request_id = next_router_request_id();
-        let send_ctx = rpc_context("sendTransaction", &session.endpoint, send_request_id);
-        let send_body = serde_json::json!({
-            "jsonrpc":"2.0","id":send_request_id,"method":"sendTransaction",
-            "params":[ base64_tx, {
-                "encoding":"base64",
-                "skipPreflight": true,
-                "preflightCommitment":"processed"
-            }]
-        });
-        let send_start = Instant::now();
-        let send = self.post_json(&session.endpoint, &send_body, api_key).await;
-        let send = match send {
-            Ok(resp) => resp,
-            Err(err) => {
-                if let Some(tel) = &telemetry {
-                    tel.record_execute(Some(exec_start.elapsed()), false);
-                }
-                return Err(err).with_context(|| send_ctx.clone());
-            }
-        };
-        let exec_duration = send_start.elapsed();
-        if let Some(tel) = &telemetry {
-            tel.record_router_usage(false, true);
-        }
-        if let Some(err) = send.value.get("error") {
-            if let Some(tel) = &telemetry {
-                tel.record_execute(Some(exec_start.elapsed()), false);
-            }
-            return Err(anyhow!("sendTransaction RPC error: {err}"))
-                .with_context(|| send_ctx.clone());
-        }
-        let signature = send.value.get("result").and_then(|v| v.as_str());
-        if signature.is_none() {
-            if let Some(tel) = &telemetry {
-                tel.record_execute(Some(exec_start.elapsed()), false);
-            }
-            return Err(anyhow!("sendTransaction missing string result"))
-                .with_context(|| send_ctx.clone());
-        }
-        let _signature = signature.unwrap();
 
         if let Some(tel) = &telemetry {
-            tel.record_execute(Some(exec_start.elapsed()), true);
+            tel.record_execute(Some(exec_start.elapsed()), result.is_ok());
         }
 
-        Ok(ErOutput {
-            settlement_instructions: instructions,
-            settlement_accounts: Vec::new(),
-            plan_fingerprint: Some(compute_plan_fingerprint(intents)),
-            exec_duration,
-            blockhash_plan: None,
-        })
+        result
     }
 
     async fn end_session(&self, _session: &ErSession) -> Result<()> {
