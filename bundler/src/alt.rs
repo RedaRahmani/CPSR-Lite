@@ -289,7 +289,7 @@ impl CachingAltManager {
 
 impl AltManager for CachingAltManager {
     fn resolve_tables(&self, payer: Pubkey, intents: &[UserIntent]) -> AltResolution {
-        let mut resolution = self.compute_offload_plan(payer, intents);
+        let resolution = self.compute_offload_plan(payer, intents);
 
         // Cache hit detection for the real-catalog path (key not based on KeyUsage struct)
         if resolution.tables.is_empty() && self.catalog.is_some() {

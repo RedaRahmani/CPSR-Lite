@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use chrono::Utc;
 use cpsr_types::{
     hash::{dhash, Hash32, ZERO32},
     serde::InstructionSer,
@@ -89,6 +90,7 @@ pub struct ErClientConfig {
     pub min_cu_threshold: u64,
     pub merge_small_intents: bool,
     pub telemetry: Option<Arc<ErTelemetry>>,
+    pub wiretap: Option<Arc<dyn ErWiretap>>,
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +138,8 @@ pub struct ErSession {
     pub started_at: Instant,
     pub route_duration: Duration,
     pub blockhash_plan: Option<ErBlockhashPlan>,
+    pub data_plane: bool,
+    pub fallback_reason: Option<String>,
 }
 
 /// Result of executing a chunk inside an ER session.
@@ -146,6 +150,7 @@ pub struct ErOutput {
     pub plan_fingerprint: Option<Hash32>,
     pub exec_duration: Duration,
     pub blockhash_plan: Option<ErBlockhashPlan>,
+    pub signature: Option<String>,
 }
 
 /// Aggregated telemetry for ER attempts.
@@ -176,6 +181,14 @@ pub struct ErTelemetry {
     blockhash_cache_misses: AtomicU64,
     small_chunk_skips: AtomicU64,
     merged_small_chunks: AtomicU64,
+    dp_begin_ok: AtomicU64,
+    dp_begin_err: AtomicU64,
+    dp_execute_ok: AtomicU64,
+    dp_execute_err: AtomicU64,
+    dp_end_ok: AtomicU64,
+    dp_end_err: AtomicU64,
+    blockhash_plan_hits: AtomicU64,
+    blockhash_plan_misses: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -210,6 +223,14 @@ pub struct ErTelemetrySummary {
     pub blockhash_cache_misses: u64,
     pub small_chunk_skips: u64,
     pub merged_small_chunks: u64,
+    pub dp_begin_ok: u64,
+    pub dp_begin_err: u64,
+    pub dp_execute_ok: u64,
+    pub dp_execute_err: u64,
+    pub dp_end_ok: u64,
+    pub dp_end_err: u64,
+    pub blockhash_plan_hits: u64,
+    pub blockhash_plan_misses: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -265,19 +286,22 @@ impl ErTelemetry {
         }
     }
 
-    pub fn record_blockhash(&self, duration: Option<Duration>, success: bool) {
+    pub fn record_blockhash(&self, _duration: Option<Duration>, success: bool) {
         self.sessions.fetch_add(1, Ordering::Relaxed);
         if success {
             self.successes.fetch_add(1, Ordering::Relaxed);
-            self.bhfa_ok.fetch_add(1, Ordering::Relaxed);
-            if let Some(dur) = duration {
-                if let Ok(mut samples) = self.bhfa_ms.lock() {
-                    samples.push(dur.as_millis() as u128);
-                }
-            }
-        } else {
-            self.bhfa_err.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn record_bhfa_success(&self, duration: Duration) {
+        self.bhfa_ok.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut samples) = self.bhfa_ms.lock() {
+            samples.push(duration.as_millis() as u128);
+        }
+    }
+
+    pub fn record_bhfa_failure(&self) {
+        self.bhfa_err.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_fallback(&self) {
@@ -321,6 +345,38 @@ impl ErTelemetry {
         }
     }
 
+    pub fn record_dp_begin(&self, success: bool) {
+        if success {
+            self.dp_begin_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.dp_begin_err.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_dp_execute(&self, success: bool) {
+        if success {
+            self.dp_execute_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.dp_execute_err.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_dp_end(&self, success: bool) {
+        if success {
+            self.dp_end_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.dp_end_err.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_blockhash_plan(&self, hit: bool) {
+        if hit {
+            self.blockhash_plan_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.blockhash_plan_misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn record_blockhash_cache(&self, hit: bool) {
         if hit {
             self.blockhash_cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -361,6 +417,14 @@ impl ErTelemetry {
         let session_begin_attempts = self.session_begin_attempts.load(Ordering::Relaxed);
         let session_begin_ok = self.session_begin_ok.load(Ordering::Relaxed);
         let session_begin_err = self.session_begin_err.load(Ordering::Relaxed);
+        let dp_begin_ok = self.dp_begin_ok.load(Ordering::Relaxed);
+        let dp_begin_err = self.dp_begin_err.load(Ordering::Relaxed);
+        let dp_execute_ok = self.dp_execute_ok.load(Ordering::Relaxed);
+        let dp_execute_err = self.dp_execute_err.load(Ordering::Relaxed);
+        let dp_end_ok = self.dp_end_ok.load(Ordering::Relaxed);
+        let dp_end_err = self.dp_end_err.load(Ordering::Relaxed);
+        let blockhash_plan_hits = self.blockhash_plan_hits.load(Ordering::Relaxed);
+        let blockhash_plan_misses = self.blockhash_plan_misses.load(Ordering::Relaxed);
         let last_router_error = self
             .last_router_error
             .lock()
@@ -415,6 +479,14 @@ impl ErTelemetry {
             blockhash_cache_misses,
             small_chunk_skips,
             merged_small_chunks,
+            dp_begin_ok,
+            dp_begin_err,
+            dp_execute_ok,
+            dp_execute_err,
+            dp_end_ok,
+            dp_end_err,
+            blockhash_plan_hits,
+            blockhash_plan_misses,
         }
     }
 }
@@ -661,6 +733,12 @@ pub trait ErClient: Send + Sync {
     async fn end_session(&self, session: &ErSession) -> Result<()>;
 }
 
+/// Sink for emitting ER wiretap payloads.
+pub trait ErWiretap: Send + Sync + std::fmt::Debug {
+    fn write_json(&self, filename: &str, value: &serde_json::Value);
+    fn write_string(&self, filename: &str, body: &str);
+}
+
 /// Router-resolving ER client (HTTP).
 pub struct ErHttpClientInner {
     cfg: ErClientConfig,
@@ -671,6 +749,8 @@ pub struct ErHttpClientInner {
     data_plane_api_key: Option<HeaderValue>,
     blockhash_cache: Mutex<Option<BlockhashCacheEntry>>,
     telemetry: Option<Arc<ErTelemetry>>,
+    wiretap: Option<Arc<dyn ErWiretap>>,
+    data_plane_announced: AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -765,6 +845,7 @@ impl ErHttpClientInner {
         };
 
         let telemetry = cfg.telemetry.clone();
+        let wiretap = cfg.wiretap.clone();
 
         Ok(Self {
             cfg,
@@ -774,6 +855,8 @@ impl ErHttpClientInner {
             data_plane_api_key,
             blockhash_cache: Mutex::new(None),
             telemetry,
+            wiretap,
+            data_plane_announced: AtomicBool::new(false),
         })
     }
 
@@ -1134,6 +1217,233 @@ impl ErHttpClientInner {
         self.data_plane_api_key.as_ref()
     }
 
+    fn wiretap(&self) -> Option<Arc<dyn ErWiretap>> {
+        self.wiretap.clone()
+    }
+
+    fn wiretap_write_json(&self, filename: &str, value: &serde_json::Value) {
+        if let Some(tap) = self.wiretap() {
+            tap.write_json(filename, value);
+        }
+    }
+
+    fn wiretap_write_string(&self, filename: &str, body: &str) {
+        if let Some(tap) = self.wiretap() {
+            tap.write_string(filename, body);
+        }
+    }
+
+    fn wiretap_dp_timestamp() -> String {
+        Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string()
+    }
+
+    fn wiretap_dp_filename(method: &str, ts: &str, suffix: &str) -> String {
+        format!("dp-{}-{}_{}", method, ts, suffix)
+    }
+
+    fn announce_data_plane(&self, endpoint: &Url) {
+        if !self.data_plane_announced.swap(true, Ordering::Relaxed) {
+            info!(
+                target: "er.dp",
+                endpoint = endpoint.as_str(),
+                "data-plane mode ACTIVE"
+            );
+        }
+    }
+
+    fn convert_blockhash_plan(
+        &self,
+        route: &ErRouteInfo,
+        plan: &DataPlaneBlockhashPlan,
+        route_duration: Duration,
+        blockhash_duration: Duration,
+        source: BlockhashSource,
+        fetched_from: Option<&Url>,
+    ) -> Result<ErBlockhashPlan> {
+        let hash = Hash::from_str(&plan.blockhash)
+            .map_err(|e| anyhow!("invalid blockhash from data-plane: {e}"))?;
+        Ok(ErBlockhashPlan {
+            route: route.clone(),
+            blockhash: ErBlockhash {
+                hash,
+                last_valid_block_height: plan.last_valid_slot,
+                fetched_from: fetched_from
+                    .cloned()
+                    .unwrap_or_else(|| route.endpoint.clone()),
+                source,
+                request_id: next_router_request_id(),
+            },
+            route_duration,
+            blockhash_duration,
+            blockhash_fetched_at: Instant::now(),
+        })
+    }
+
+    async fn fetch_blockhash_plan_via_bhfa(
+        &self,
+        accounts: &[Pubkey],
+        route: &ErRouteInfo,
+        route_duration: Duration,
+    ) -> Result<ErBlockhashPlan> {
+        let cfg = bhfa::BhfaConfig::new(
+            self.cfg.router_url.clone(),
+            self.cfg.router_api_key.clone(),
+            self.cfg.http_timeout,
+            self.cfg.connect_timeout,
+        );
+
+        let bhfa_start = Instant::now();
+        let (hash, last_valid_slot) = match bhfa::get_blockhash_for_accounts(&cfg, accounts).await {
+            Ok(res) => res,
+            Err(err) => {
+                if let Some(tel) = &self.telemetry {
+                    tel.record_bhfa_failure();
+                }
+                return Err(err.context("bhfa request"));
+            }
+        };
+        let bhfa_duration = bhfa_start.elapsed();
+        if let Some(tel) = &self.telemetry {
+            tel.record_bhfa_success(bhfa_duration);
+        }
+
+        let plan = DataPlaneBlockhashPlan {
+            blockhash: hash.to_string(),
+            last_valid_slot,
+        };
+
+        self.convert_blockhash_plan(
+            route,
+            &plan,
+            route_duration,
+            bhfa_duration,
+            BlockhashSource::Router,
+            Some(&self.cfg.router_url),
+        )
+    }
+
+    async fn begin_session_router(&self, accounts: &[Pubkey]) -> Result<ErSession> {
+        let route_start = Instant::now();
+        let route = self.resolve_route().await?;
+        let route_duration = route_start.elapsed();
+
+        info!(
+            target: "er",
+            route = route.endpoint.as_str(),
+            route_ms = route_duration.as_millis(),
+            accounts = accounts.len(),
+            "ER session context established (router discovery only)"
+        );
+
+        Ok(ErSession {
+            id: "router-session".to_string(),
+            route: route.clone(),
+            endpoint: route.endpoint.clone(),
+            accounts: accounts.to_vec(),
+            started_at: Instant::now(),
+            route_duration,
+            blockhash_plan: None,
+            data_plane: false,
+            fallback_reason: None,
+        })
+    }
+
+    async fn execute_router(
+        &self,
+        session: &ErSession,
+        intents: &[UserIntent],
+        telemetry: Option<&Arc<ErTelemetry>>,
+    ) -> Result<ErOutput> {
+        let instructions = intents_to_instructions(intents)
+            .context("failed to convert intents into instructions")?;
+
+        let recent_blockhash = self
+            .get_latest_blockhash(&session.endpoint)
+            .await
+            .context("fetching latest blockhash for ER execute")?;
+
+        let base64_tx =
+            build_and_sign_base64(&instructions, self.cfg.payer.as_ref(), recent_blockhash)
+                .context("building and signing ER transaction")?;
+        let api_key = self.data_plane_api_key_header();
+
+        let sim_request_id = next_router_request_id();
+        let sim_ctx = rpc_context("simulateTransaction", &session.endpoint, sim_request_id);
+        let sim_body = serde_json::json!({
+            "jsonrpc":"2.0","id":sim_request_id,"method":"simulateTransaction",
+            "params":[ base64_tx.clone(), {
+                "encoding":"base64",
+                "replaceRecentBlockhash": false,
+                "sigVerify": true,
+                "commitment": "processed"
+            }]
+        });
+        let sim_ts = Self::wiretap_dp_timestamp();
+        let sim_req_name = Self::wiretap_dp_filename("simulateTransaction", &sim_ts, "req.json");
+        self.wiretap_write_json(&sim_req_name, &sim_body);
+        let sim = self
+            .post_json(&session.endpoint, &sim_body, api_key)
+            .await
+            .with_context(|| sim_ctx.clone())?;
+        let sim_resp_name = Self::wiretap_dp_filename("simulateTransaction", &sim_ts, "resp.txt");
+        let sim_pretty =
+            serde_json::to_string_pretty(&sim.value).unwrap_or_else(|_| sim.value.to_string());
+        self.wiretap_write_string(&sim_resp_name, &sim_pretty);
+        ensure_simulation_success(&sim.value).with_context(|| sim_ctx.clone())?;
+        if let Some(tel) = telemetry {
+            tel.record_router_usage(true, false);
+        }
+
+        let send_request_id = next_router_request_id();
+        let send_ctx = rpc_context("sendTransaction", &session.endpoint, send_request_id);
+        let send_body = serde_json::json!({
+            "jsonrpc":"2.0","id":send_request_id,"method":"sendTransaction",
+            "params":[ base64_tx, {
+                "encoding":"base64",
+                "skipPreflight": true,
+                "preflightCommitment":"processed"
+            }]
+        });
+        let send_ts = Self::wiretap_dp_timestamp();
+        let send_req_name = Self::wiretap_dp_filename("sendTransaction", &send_ts, "req.json");
+        self.wiretap_write_json(&send_req_name, &send_body);
+        let send_start = Instant::now();
+        let send = self
+            .post_json(&session.endpoint, &send_body, api_key)
+            .await
+            .with_context(|| send_ctx.clone())?;
+        let exec_duration = send_start.elapsed();
+        let send_resp_name = Self::wiretap_dp_filename("sendTransaction", &send_ts, "resp.txt");
+        let send_pretty =
+            serde_json::to_string_pretty(&send.value).unwrap_or_else(|_| send.value.to_string());
+        self.wiretap_write_string(&send_resp_name, &send_pretty);
+
+        if let Some(err) = send.value.get("error") {
+            Err(anyhow!("sendTransaction RPC error: {err}")).with_context(|| send_ctx.clone())?;
+        }
+
+        let signature = send
+            .value
+            .get("result")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("sendTransaction missing string result"))
+            .with_context(|| send_ctx.clone())?
+            .to_string();
+
+        if let Some(tel) = telemetry {
+            tel.record_router_usage(false, true);
+        }
+
+        Ok(ErOutput {
+            settlement_instructions: instructions,
+            settlement_accounts: Vec::new(),
+            plan_fingerprint: Some(compute_plan_fingerprint(intents)),
+            exec_duration,
+            blockhash_plan: None,
+            signature: Some(signature),
+        })
+    }
+
     async fn get_latest_blockhash(&self, endpoint: &Url) -> Result<Hash> {
         let request_id = next_router_request_id();
         let ctx_label = rpc_context("getLatestBlockhash", endpoint, request_id);
@@ -1203,28 +1513,7 @@ impl ErClient for ErHttpClientInner {
         if accounts.is_empty() {
             bail!("begin_session requires at least one account");
         }
-
-        let route_start = Instant::now();
-        let route = self.resolve_route().await?;
-        let route_duration = route_start.elapsed();
-
-        info!(
-            target: "er",
-            route = route.endpoint.as_str(),
-            route_ms = route_duration.as_millis(),
-            accounts = accounts.len(),
-            "ER session context established (router discovery only)"
-        );
-
-        Ok(ErSession {
-            id: "router-session".to_string(),
-            route: route.clone(),
-            endpoint: route.endpoint.clone(),
-            accounts: accounts.to_vec(),
-            started_at: Instant::now(),
-            route_duration,
-            blockhash_plan: None,
-        })
+        self.begin_session_router(accounts).await
     }
 
     // async fn execute(&self, _session: &ErSession, _intents: &[UserIntent]) -> Result<ErOutput> {
@@ -1236,82 +1525,9 @@ impl ErClient for ErHttpClientInner {
     async fn execute(&self, session: &ErSession, intents: &[UserIntent]) -> Result<ErOutput> {
         let exec_start = Instant::now();
         let telemetry = self.telemetry.clone();
-
-        let result: Result<ErOutput> = {
-            let instructions = intents_to_instructions(intents)
-                .context("failed to convert intents into instructions")?;
-
-            let recent_blockhash = self
-                .get_latest_blockhash(&session.endpoint)
-                .await
-                .context("fetching latest blockhash for ER execute")?;
-
-            let base64_tx =
-                build_and_sign_base64(&instructions, self.cfg.payer.as_ref(), recent_blockhash)
-                    .context("building and signing ER transaction")?;
-            let api_key = self.data_plane_api_key_header();
-
-            let sim_request_id = next_router_request_id();
-            let sim_ctx = rpc_context("simulateTransaction", &session.endpoint, sim_request_id);
-            let sim_body = serde_json::json!({
-                "jsonrpc":"2.0","id":sim_request_id,"method":"simulateTransaction",
-                "params":[ base64_tx.clone(), {
-                    "encoding":"base64",
-                    "replaceRecentBlockhash": false,
-                    "sigVerify": true,
-                    "commitment": "processed"
-                }]
-            });
-            let sim = self
-                .post_json(&session.endpoint, &sim_body, api_key)
-                .await
-                .with_context(|| sim_ctx.clone())?;
-            ensure_simulation_success(&sim.value).with_context(|| sim_ctx.clone())?;
-            if let Some(tel) = &telemetry {
-                tel.record_router_usage(true, false);
-            }
-
-            let send_request_id = next_router_request_id();
-            let send_ctx = rpc_context("sendTransaction", &session.endpoint, send_request_id);
-            let send_body = serde_json::json!({
-                "jsonrpc":"2.0","id":send_request_id,"method":"sendTransaction",
-                "params":[ base64_tx, {
-                    "encoding":"base64",
-                    "skipPreflight": true,
-                    "preflightCommitment":"processed"
-                }]
-            });
-            let send_start = Instant::now();
-            let send = self
-                .post_json(&session.endpoint, &send_body, api_key)
-                .await
-                .with_context(|| send_ctx.clone())?;
-            let exec_duration = send_start.elapsed();
-
-            if let Some(err) = send.value.get("error") {
-                Err(anyhow!("sendTransaction RPC error: {err}"))
-                    .with_context(|| send_ctx.clone())?;
-            }
-
-            let _signature = send
-                .value
-                .get("result")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("sendTransaction missing string result"))
-                .with_context(|| send_ctx.clone())?;
-
-            if let Some(tel) = &telemetry {
-                tel.record_router_usage(false, true);
-            }
-
-            Ok(ErOutput {
-                settlement_instructions: instructions,
-                settlement_accounts: Vec::new(),
-                plan_fingerprint: Some(compute_plan_fingerprint(intents)),
-                exec_duration,
-                blockhash_plan: None,
-            })
-        };
+        let result = self
+            .execute_router(session, intents, telemetry.as_ref())
+            .await;
 
         if let Some(tel) = &telemetry {
             tel.record_execute(Some(exec_start.elapsed()), result.is_ok());
@@ -1389,6 +1605,55 @@ struct BlockhashRpcResult {
     blockhash: String,
     #[serde(rename = "lastValidBlockHeight")]
     last_valid_block_height: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataPlaneBeginResult {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "blockhashPlan")]
+    blockhash_plan: Option<DataPlaneBlockhashPlan>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct DataPlaneBlockhashPlan {
+    blockhash: String,
+    #[serde(rename = "lastValidSlot")]
+    last_valid_slot: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DataPlaneExecuteMetrics {
+    #[serde(rename = "cuUsed")]
+    cu_used: Option<u64>,
+    #[serde(rename = "fee")]
+    fee_lamports: Option<u64>,
+    #[serde(rename = "elapsedMs")]
+    elapsed_ms: Option<u64>,
+}
+
+impl Default for DataPlaneExecuteMetrics {
+    fn default() -> Self {
+        Self {
+            cu_used: None,
+            fee_lamports: None,
+            elapsed_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DataPlaneExecuteResult {
+    #[serde(rename = "settlementInstructions")]
+    settlement_instructions: Option<Vec<InstructionSer>>,
+    #[serde(rename = "settlementAccounts")]
+    settlement_accounts: Option<Vec<String>>,
+    #[serde(rename = "planFingerprint")]
+    plan_fingerprint: Option<String>,
+    #[serde(rename = "blockhashPlan")]
+    blockhash_plan: Option<DataPlaneBlockhashPlan>,
+    #[serde(default)]
+    metrics: DataPlaneExecuteMetrics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

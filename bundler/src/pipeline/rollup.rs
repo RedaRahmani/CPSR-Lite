@@ -19,7 +19,7 @@ use crate::{
     alt::{AltManager, AltResolution},
     er::{
         classify_router_error, compute_plan_fingerprint, BlockhashSource, ErBlockhashPlan,
-        ErClient, ErTelemetry,
+        ErClient, ErOutput, ErTelemetry,
     },
     fee::FeePlan,
     occ::{
@@ -252,6 +252,7 @@ struct ErChunkMeta {
     route_cache_hit: Option<bool>,
     session_id: Option<String>,
     fallback_reason: Option<String>,
+    signature: Option<String>,
 }
 
 pub(crate) struct ErPreparedChunk {
@@ -484,20 +485,27 @@ impl ErExecutionCtx {
             );
         }
 
-        let settlement_accounts = if output.settlement_accounts.is_empty() {
+        let ErOutput {
+            settlement_instructions,
+            settlement_accounts,
+            plan_fingerprint,
+            exec_duration,
+            blockhash_plan,
+            signature,
+        } = output;
+
+        let settlement_accounts = if settlement_accounts.is_empty() {
             accounts.clone()
         } else {
-            output.settlement_accounts.clone()
+            settlement_accounts
         };
 
-        let settlement_plan_fp = output.plan_fingerprint.or(Some(plan_fp));
-        let settlement_blockhash = output
-            .blockhash_plan
+        let settlement_plan_fp = plan_fingerprint.or(Some(plan_fp));
+        let settlement_blockhash = blockhash_plan
             .clone()
             .or_else(|| session.blockhash_plan.clone());
 
-        let settlement_intents: Vec<UserIntent> = output
-            .settlement_instructions
+        let settlement_intents: Vec<UserIntent> = settlement_instructions
             .into_iter()
             .map(|ix| UserIntent::new(payer, ix, 0, None).normalized())
             .collect();
@@ -519,7 +527,7 @@ impl ErExecutionCtx {
             session_id = session.id.as_str(),
             settlement_ixs = settlement_intents.len(),
             settlement_accounts = settlement_accounts.len(),
-            exec_ms = output.exec_duration.as_millis(),
+            exec_ms = exec_duration.as_millis(),
             "ER execution produced settlement instructions"
         );
 
@@ -529,12 +537,13 @@ impl ErExecutionCtx {
                 plan_fingerprint: settlement_plan_fp,
                 blockhash_plan: settlement_blockhash,
                 settlement_accounts,
-                execution_duration: Some(output.exec_duration),
+                execution_duration: Some(exec_duration),
                 simulated: false,
                 route_endpoint: Some(session.endpoint.as_str().to_string()),
                 route_cache_hit: Some(session.route.cache_hit),
                 session_id: Some(session.id.clone()),
                 fallback_reason: None,
+                signature,
             },
         })
     }
@@ -563,6 +572,7 @@ impl ErExecutionCtx {
                 route_cache_hit: None,
                 session_id: None,
                 fallback_reason: reason,
+                signature: None,
             },
         }
     }
@@ -659,6 +669,7 @@ pub struct ChunkSuccessData {
     pub er_blockhash_plan: Option<ErBlockhashPlan>,
     pub er_simulated: bool,
     pub er_execution_duration: Option<Duration>,
+    pub er_signature: Option<String>,
 }
 
 /// Final per-chunk outcome.
@@ -1136,6 +1147,7 @@ where
                     er_blockhash_plan: er_meta.as_ref().and_then(|m| m.blockhash_plan.clone()),
                     er_simulated: er_meta.as_ref().map(|m| m.simulated).unwrap_or(false),
                     er_execution_duration: er_meta.as_ref().and_then(|m| m.execution_duration),
+                    er_signature: er_meta.as_ref().and_then(|m| m.signature.clone()),
                 },
                 timings: ChunkTimings {
                     total: total_start.elapsed(),
@@ -1280,6 +1292,8 @@ mod tests {
             started_at: Instant::now(),
             route_duration: Duration::from_millis(5),
             blockhash_plan: None,
+            data_plane: false,
+            fallback_reason: None,
         };
 
         let settlement_ix = Instruction {
@@ -1306,6 +1320,7 @@ mod tests {
                 blockhash_duration: Duration::from_millis(1),
                 blockhash_fetched_at: Instant::now(),
             }),
+            signature: None,
         };
 
         mock.push_begin(Ok(session));

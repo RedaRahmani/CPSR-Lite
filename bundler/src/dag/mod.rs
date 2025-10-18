@@ -184,7 +184,7 @@ impl Dag {
         let n = self.nodes.len();
         let mut indeg = vec![0u32; n];
         for v in 0..n {
-            for &u in &self.rev_edges[v] {
+            for &_ in &self.rev_edges[v] {
                 indeg[v] = indeg[v].saturating_add(1);
             }
         }
@@ -221,7 +221,7 @@ impl Dag {
         let n = self.nodes.len();
         let mut indeg = vec![0u32; n];
         for v in 0..n {
-            for &u in &self.rev_edges[v] {
+            for &_ in &self.rev_edges[v] {
                 indeg[v] = indeg[v].saturating_add(1);
             }
         }

@@ -69,6 +69,7 @@ mod tests {
             min_cu_threshold: 0,
             merge_small_intents: false,
             telemetry: None,
+            wiretap: None,
         }
     }
 

@@ -13,45 +13,48 @@
 // - Extra tracing around JSON-RPC error mapping and endpoint construction
 
 use std::{
-    cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
-use bundler::er::bhfa::{collect_writables_or_payer, get_blockhash_for_accounts, BhfaConfig};
-use bundler::pipeline::blockhash::{BlockhashProvider, ErAwareBlockhashProvider};
+use bundler::er::bhfa::BhfaConfig;
+use bundler::pipeline::blockhash::{
+    BlockhashManager, BlockhashPolicy, BlockhashProvider, ErAwareBlockhashProvider, LeaseOutcome,
+};
 use bundler::{
     alt::table_catalog::TableCatalog,
     alt::{AltManager, AltResolution, CachingAltManager, NoAltManager},
     chunking::{chunk_layer_with, AltPolicy, BasicOracle as ChunkOracle, TxBudget},
-    dag::Dag,
+    dag::{Dag, NodeId},
     er::{
-        json_rpc_code_meaning, ErClient, ErClientConfig, ErPrivacyMode, ErTelemetry, HttpErClient,
+        json_rpc_code_meaning, ErClient, ErClientConfig, ErPrivacyMode, ErTelemetry, ErWiretap,
+        HttpErClient,
     },
     fee::FeeOracle,
     occ::rpc_fetcher::RpcAccountFetcher,
     occ::{occ_metrics_snapshot, OccConfig},
-    pipeline::{
-        blockhash::{BlockhashManager, BlockhashPolicy},
-        rollup::{
-            send_layer_parallel, ChunkEstimates, ChunkPlan, ErExecutionCtx, LayerResult,
-            ParallelLayerConfig, ParallelLayerDeps,
-        },
+    pipeline::rollup::{
+        send_layer_parallel, ChunkEstimates, ChunkPlan, ErExecutionCtx, LayerResult,
+        ParallelLayerConfig, ParallelLayerDeps,
     },
-    sender::{global_rpc_metrics_snapshot, track_get_latest_blockhash, CuScope, ReliableSender},
+    sender::{global_rpc_metrics_snapshot, CuScope, ReliableSender},
     serializer::signatures_section_len,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{
-    commitment_config::CommitmentConfig, hash::Hash, pubkey::Pubkey, signature::read_keypair_file,
-    signer::Signer, system_instruction,
+    commitment_config::CommitmentConfig,
+    hash::Hash,
+    pubkey::Pubkey,
+    signature::{read_keypair_file, Keypair},
+    signer::Signer,
+    system_instruction,
 };
 
 use cpsr_types::UserIntent;
@@ -64,6 +67,7 @@ use url::Url;
 use std::os::unix::fs::PermissionsExt;
 
 // === Minimal JSON-RPC types (kept for router + node diagnostics) ===
+#[allow(non_snake_case)]
 #[derive(Debug, Deserialize)]
 struct GetRoutesResultItem {
     fqdn: String,
@@ -105,7 +109,7 @@ fn get_routes_url(base: &Url) -> Result<Url> {
 
 // -------------------- Wiretap (optional dump to disk) --------------------
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Wiretap {
     dir: Option<PathBuf>,
 }
@@ -150,6 +154,22 @@ impl Wiretap {
 
     fn write_string(&self, filename: &str, s: &str) {
         self.write_bytes(filename, s.as_bytes());
+    }
+}
+
+impl ErWiretap for Wiretap {
+    fn write_json(&self, filename: &str, value: &serde_json::Value) {
+        if self.enabled() {
+            if let Ok(body) = serde_json::to_string_pretty(value) {
+                self.write_string(filename, &body);
+            }
+        }
+    }
+
+    fn write_string(&self, filename: &str, body: &str) {
+        if self.enabled() {
+            self.write_bytes(filename, body.as_bytes());
+        }
     }
 }
 
@@ -676,6 +696,10 @@ struct Args {
     #[arg(long)]
     out_report: Option<PathBuf>,
 
+    /// Emit signatures collected per path (preview in stdout)
+    #[arg(long, default_value_t = false)]
+    print_sigs: bool,
+
     /// Enable Ephemeral Rollups optimization
     #[arg(long, default_value_t = false)]
     er_enabled: bool,
@@ -748,6 +772,10 @@ struct Args {
     /// When set, allow chunker to merge adjacent tiny intents for ER optimization
     #[arg(long, default_value_t = false)]
     er_merge_small_intents: bool,
+
+    /// Which run mode to execute: er-only | baseline-only | compare
+    #[arg(long, value_enum, default_value_t = RunMode::Compare)]
+    mode: RunMode,
 }
 
 #[derive(Subcommand, Debug)]
@@ -779,6 +807,15 @@ impl From<ErPrivacyCli> for ErPrivacyMode {
             ErPrivacyCli::Private => ErPrivacyMode::Private,
         }
     }
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum RunMode {
+    #[clap(alias = "er")]
+    ErOnly,
+    #[clap(alias = "baseline")]
+    BaselineOnly,
+    Compare,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -903,6 +940,2017 @@ struct TracingReport {
     rpc: bundler::sender::RpcMetrics,
     mock_in_use: bool,
     rpc_url: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct DurationStats {
+    p50_ms: Option<f64>,
+    p95_ms: Option<f64>,
+    stddev_ms: Option<f64>,
+    variance_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct ErRunResult {
+    rollup_reports: Vec<TxCost>,
+    signatures: Vec<String>,
+    layer_summaries: Vec<LayerSummary>,
+    er_chunk_rows: Vec<ErChunkSummaryRow>,
+    dag_layer_sizes: Vec<usize>,
+    dag_node_count: usize,
+    dag_duration: Duration,
+    er_real_chunks: usize,
+    er_simulated_chunks: usize,
+    er_cu_total: u64,
+    er_fee_total: u64,
+    er_latency_stats: DurationStats,
+    er_exec_stats: DurationStats,
+    plan_fingerprint_coverage: f64,
+    er_success_rate: f64,
+    er_fallback_rate: f64,
+    router_health_summary: Option<RouterHealthSummary>,
+    telemetry_summary: Option<bundler::er::ErTelemetrySummary>,
+    blockhash_metrics: bundler::pipeline::blockhash::BlockhashMetrics,
+    alt_metrics: bundler::alt::AltMetrics,
+    occ_metrics: bundler::occ::OccMetrics,
+    rpc_metrics: bundler::sender::RpcMetrics,
+}
+
+#[derive(Clone, Debug)]
+struct BaselineRunResult {
+    baseline_reports: Vec<TxCost>,
+    signatures: Vec<String>,
+    dag_layer_sizes: Vec<usize>,
+    dag_node_count: usize,
+    dag_duration: Duration,
+    fee_total: u64,
+    fee_avg: Option<f64>,
+    tx_count: usize,
+    latency_stats: DurationStats,
+    rpc_metrics: bundler::sender::RpcMetrics,
+    blockhash_metrics: bundler::pipeline::blockhash::BlockhashMetrics,
+    blockhash_stats: BaselineBlockhashStats,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct BaselineBlockhashStats {
+    bhfa_ok: u64,
+    bhfa_err: u64,
+    rpc_fallback: u64,
+}
+
+struct SharedSetup {
+    wiretap: Wiretap,
+    rpc_base_url: String,
+    payer: Arc<Keypair>,
+    payer_pubkey: Pubkey,
+    commitment: CommitmentConfig,
+    mock_in_use: bool,
+    rpc: Arc<RpcClient>,
+    safety: SafetyMargins,
+    tx_budget: TxBudget,
+    alt_policy: AltPolicy,
+    occ_cfg: OccConfig,
+    sender: Arc<ReliableSender>,
+    alt_mgr: Arc<dyn AltManager>,
+    account_fetcher: Arc<RpcAccountFetcher>,
+    parallel_cfg_template: ParallelLayerConfig,
+    intents: Vec<UserIntent>,
+    dag: Dag,
+    layers: Vec<Vec<NodeId>>,
+    dag_duration: Duration,
+    blockhash_policy: BlockhashPolicy,
+    blockhash_pre_check: bool,
+    er_context: Option<ErRuntimeContext>,
+}
+
+#[derive(Clone)]
+struct ErRuntimeContext {
+    er_ctx_opt: Option<ErExecutionCtx>,
+    er_metrics: Option<Arc<ErTelemetry>>,
+    er_bhfa_cfg: Option<BhfaConfig>,
+    blockhash_manager: Arc<BlockhashManager>,
+    blockhash_provider: Arc<dyn BlockhashProvider>,
+}
+
+#[derive(Clone)]
+struct BaselineRuntimeContext {
+    blockhash_manager: Arc<BlockhashManager>,
+}
+
+impl SharedSetup {
+    async fn build(args: &Args) -> Result<Self> {
+        let mut rpc_base_url = args.rpc.clone();
+        let payer = Arc::new(
+            read_keypair_file(&args.payer)
+                .map_err(|e| anyhow!("reading keypair {:?}: {e}", args.payer))?,
+        );
+        let payer_pubkey = payer.pubkey();
+        let commitment = parse_commitment(&args.commitment);
+
+        let wiretap = Wiretap::new(args.er_wiretap_dir.clone());
+        let mut er_bhfa_cfg: Option<BhfaConfig> = None;
+
+        let intents: Vec<UserIntent> = if let Some(path) = args.intents.as_ref() {
+            let data = fs::read_to_string(path).context("reading intents file")?;
+            let parsed: Vec<UserIntent> =
+                serde_json::from_str(&data).context("parsing intents JSON")?;
+            parsed.into_iter().map(|ui| ui.normalized()).collect()
+        } else if args.demo_mixed {
+            let to_str = args.demo_conflicting_to.as_ref().ok_or_else(|| {
+                anyhow!("--demo-mixed also requires --demo-conflicting-to <PUBKEY>")
+            })?;
+            let dest = Pubkey::from_str(to_str)
+                .map_err(|_| anyhow!("--demo-conflicting-to must be a valid pubkey"))?;
+
+            let mut v = Vec::new();
+            for i in 0..args.mixed_memos {
+                let ix = memo_ix(&format!("CPSR demo memo #{i}"));
+                v.push(UserIntent::new(payer_pubkey, ix, 9, None));
+            }
+            for i in 0..args.mixed_contended {
+                let ix = system_instruction::transfer(&payer_pubkey, &dest, args.demo_lamports);
+                let prio: u8 = match i % 3 {
+                    0 => 7,
+                    1 => 5,
+                    _ => 3,
+                };
+                v.push(UserIntent::new(payer_pubkey, ix, prio, None));
+            }
+            v
+        } else if let Some(to_str) = &args.demo_conflicting_to {
+            let dest = Pubkey::from_str(to_str)
+                .map_err(|_| anyhow!("--demo-conflicting-to must be a valid pubkey"))?;
+            (0..args.demo_count)
+                .map(|_| {
+                    let ix = system_instruction::transfer(&payer_pubkey, &dest, args.demo_lamports);
+                    UserIntent::new(payer_pubkey, ix, 0, None)
+                })
+                .collect()
+        } else {
+            return Err(anyhow!(
+                "Provide either --intents PATH, --demo-mixed (with --demo-conflicting-to), or --demo-conflicting-to PUBKEY"
+            ));
+        };
+        if intents.is_empty() {
+            return Err(anyhow!("No intents to run"));
+        }
+
+        let safety = SafetyMargins::default();
+        let mut tx_budget = TxBudget::default();
+        if args.er_merge_small_intents {
+            tx_budget.max_instructions = tx_budget.max_instructions.saturating_mul(2).min(60);
+            tx_budget.max_bytes = tx_budget.max_bytes.saturating_add(256);
+        }
+        let alt_policy = AltPolicy {
+            enabled: args.enable_alt,
+            ..AltPolicy::default()
+        };
+        let occ_cfg = OccConfig::default();
+
+        let (er_ctx_opt, er_metrics): (Option<ErExecutionCtx>, Option<Arc<ErTelemetry>>) = if args
+            .er_enabled
+        {
+            let telemetry = Arc::new(ErTelemetry::default());
+            let router_str = args
+                .er_router
+                .clone()
+                .unwrap_or_else(|| "https://devnet-router.magicblock.app/".to_string());
+            let router_url = Url::parse(&router_str).context("invalid --er-router URL")?;
+            let endpoint_override = match args.er_endpoint.as_deref() {
+                Some(raw) => Some(Url::parse(raw).context("invalid --er-endpoint URL")?),
+                None => None,
+            };
+
+            let http_timeout = Duration::from_millis(args.er_http_timeout_ms.max(100));
+            let connect_timeout = Duration::from_millis(args.er_connect_timeout_ms.max(50));
+            let circuit_cooldown = Duration::from_millis(args.er_circuit_cooldown_ms.max(100));
+
+            if endpoint_override.is_none() {
+                match discover_er_endpoint(
+                    &router_url,
+                    args.er_router_key.clone(),
+                    http_timeout,
+                    connect_timeout,
+                )
+                .await
+                {
+                    Ok(Some(url)) => {
+                        tracing::info!(
+                            target: "er",
+                            router = %router_url.as_str(),
+                            discovered_endpoint = %url.as_str(),
+                            "Router discovery succeeded via /getRoutes (diagnostic only; not overriding endpoint)"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            target: "er",
+                            router = %router_url.as_str(),
+                            "Router discovery returned no routes or error; proceeding with router only"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "er",
+                            router = %router_url.as_str(),
+                            "Router discovery failed ({e}); proceeding with router only"
+                        );
+                    }
+                }
+            }
+
+            if let Err(e) = probe_er_router(
+                &router_url,
+                args.er_router_key.clone(),
+                http_timeout,
+                connect_timeout,
+                &wiretap,
+            )
+            .await
+            {
+                tracing::warn!(target: "er", router = %router_url, "router probe failed: {e}");
+            }
+
+            let api_key_state = match args.er_router_key.as_deref() {
+                Some(k) if k.is_empty() => {
+                    tracing::warn!(
+                        target: "er.config",
+                        "router API key provided but empty; header will be omitted"
+                    );
+                    "empty"
+                }
+                Some(_) => "present",
+                None => "absent",
+            };
+
+            let cfg = ErClientConfig {
+                endpoint_override,
+                http_timeout,
+                connect_timeout,
+                session_ttl: Duration::from_millis(args.er_session_ms.max(1_000)),
+                retries: args.er_retries,
+                privacy_mode: args.er_privacy.into(),
+                router_url,
+                router_api_key: args.er_router_key.clone(),
+                route_cache_ttl: Duration::from_millis(args.er_route_ttl_ms),
+                circuit_breaker_failures: args.er_circuit_failures,
+                circuit_breaker_cooldown: circuit_cooldown,
+                payer: payer.clone(),
+                blockhash_cache_ttl: Duration::from_millis(args.er_blockhash_ttl_ms),
+                min_cu_threshold: args.er_min_cu_threshold,
+                merge_small_intents: args.er_merge_small_intents,
+                telemetry: Some(telemetry.clone()),
+                wiretap: if wiretap.enabled() {
+                    Some(Arc::new(wiretap.clone()) as Arc<dyn ErWiretap>)
+                } else {
+                    None
+                },
+            };
+            er_bhfa_cfg = Some(BhfaConfig::new(
+                cfg.router_url.clone(),
+                cfg.router_api_key.clone(),
+                cfg.http_timeout,
+                cfg.connect_timeout,
+            ));
+
+            let privacy_label = er_privacy_cli_label(args.er_privacy);
+            tracing::info!(
+                target: "er.config",
+                router = cfg.router_url.as_str(),
+                privacy = privacy_label,
+                http_timeout_ms = cfg.http_timeout.as_millis(),
+                connect_timeout_ms = cfg.connect_timeout.as_millis(),
+                session_ttl_ms = cfg.session_ttl.as_millis(),
+                retries = cfg.retries,
+                circuit_breaker_failures = cfg.circuit_breaker_failures,
+                circuit_breaker_cooldown_ms = cfg.circuit_breaker_cooldown.as_millis(),
+                route_cache_ttl_ms = cfg.route_cache_ttl.as_millis(),
+                blockhash_cache_ttl_ms = cfg.blockhash_cache_ttl.as_millis(),
+                min_cu_threshold = cfg.min_cu_threshold,
+                merge_small_intents = args.er_merge_small_intents,
+                endpoint_override = cfg
+                    .endpoint_override
+                    .as_ref()
+                    .map(|u| u.as_str())
+                    .unwrap_or("<none>"),
+                api_key_state = api_key_state,
+                er_require = args.er_require,
+                "ER feature gate summary"
+            );
+
+            if let Some(ep) = cfg.endpoint_override.as_ref() {
+                tracing::info!(
+                    target: "er.config",
+                    endpoint_override = ep.as_str(),
+                    "Router dispatch bypassed for data plane due to --er-endpoint"
+                );
+            }
+
+            let preflight_result = match preflight_er_connectivity(
+                &cfg,
+                &cfg.router_url,
+                cfg.router_api_key.as_deref(),
+                payer_pubkey,
+                &wiretap,
+            )
+            .await
+            {
+                Ok(res) => Some(res),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "er.preflight",
+                        router = cfg.router_url.as_str(),
+                        "preflight connectivity probe failed: {:#}",
+                        err
+                    );
+                    None
+                }
+            };
+
+            if args.er_proxy_rpc {
+                match preflight_result
+                    .as_ref()
+                    .and_then(|res| res.discovered_route_base.clone())
+                {
+                    Some(route) => {
+                        let effective = route;
+                        tracing::info!(
+                            target: "er",
+                            effective = %effective,
+                            "ER proxy mode enabled: switching effective RPC base to Magic Router route"
+                        );
+                        rpc_base_url = effective;
+                    }
+                    None => {
+                        tracing::warn!(
+                            target: "er",
+                            "ER proxy mode requested but no route discovered; keeping original --rpc"
+                        );
+                    }
+                }
+            }
+
+            let client = HttpErClient::new(cfg.clone())?;
+            let client: Arc<dyn ErClient> = Arc::new(client);
+            let enabled = true;
+
+            (
+                Some(ErExecutionCtx::new(
+                    client,
+                    telemetry.clone(),
+                    enabled,
+                    args.dry_run,
+                    cfg.min_cu_threshold,
+                    cfg.merge_small_intents,
+                )),
+                Some(telemetry),
+            )
+        } else {
+            (None, None)
+        };
+
+        let rpc = Arc::new(RpcClient::new_with_timeout_and_commitment(
+            rpc_base_url.clone(),
+            Duration::from_secs(25),
+            commitment.clone(),
+        ));
+
+        let mock_in_use = rpc_base_url.contains("mock") || std::env::var("SOLANA_RPC_MOCK").is_ok();
+        tracing::info!(
+            rpc_url = %rpc_base_url,
+            mock_in_use = mock_in_use,
+            "RPC client initialized"
+        );
+
+        let catalog = if let Some(list) = args.alt_tables.as_deref() {
+            let table_pks: Vec<Pubkey> = list
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| Pubkey::from_str(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| anyhow!("invalid --alt-tables list"))?;
+            if table_pks.is_empty() {
+                None
+            } else {
+                Some(Arc::new(TableCatalog::from_rpc(rpc.clone(), table_pks)?))
+            }
+        } else {
+            None
+        };
+
+        let mut alt_mgr_builder = CachingAltManager::new(
+            alt_policy.clone(),
+            Duration::from_millis(args.alt_cache_ttl_ms),
+        );
+        if let Some(cat) = &catalog {
+            alt_mgr_builder = alt_mgr_builder.with_catalog(cat.clone());
+        }
+        let alt_mgr: Arc<dyn AltManager> = if args.enable_alt {
+            Arc::new(alt_mgr_builder)
+        } else {
+            Arc::new(NoAltManager)
+        };
+
+        let account_fetcher = Arc::new(RpcAccountFetcher::new_with_drift(
+            rpc.clone(),
+            commitment.clone(),
+            occ_cfg.max_slot_drift,
+        ));
+
+        let max_age_ms = args.blockhash_max_age_ms.clamp(1_000, 120_000);
+        let refresh_every = args.blockhash_refresh_every_n.max(1);
+        let blockhash_policy = BlockhashPolicy {
+            max_age: Duration::from_millis(max_age_ms as u64),
+            refresh_every,
+        };
+        let blockhash_pre_check = !args.fast_send;
+        let er_context = if args.er_enabled {
+            let manager = Arc::new(BlockhashManager::new(
+                rpc.clone(),
+                commitment.clone(),
+                blockhash_policy.clone(),
+                blockhash_pre_check,
+            ));
+            let provider: Arc<dyn BlockhashProvider> = if let Some(cfg) = er_bhfa_cfg.clone() {
+                Arc::new(ErAwareBlockhashProvider::new(
+                    manager.clone(),
+                    cfg.clone(),
+                    payer_pubkey,
+                ))
+            } else {
+                manager.clone()
+            };
+            Some(ErRuntimeContext {
+                er_ctx_opt,
+                er_metrics,
+                er_bhfa_cfg,
+                blockhash_manager: manager,
+                blockhash_provider: provider,
+            })
+        } else {
+            None
+        };
+        tracing::info!(
+            target: "blockhash",
+            max_age_ms = max_age_ms,
+            refresh_every = refresh_every,
+            pre_check = blockhash_pre_check,
+            "Blockhash policy configured"
+        );
+
+        let fee_oracle: Box<dyn FeeOracle> = match args.fee_oracle {
+            FeeOracleCli::Basic => Box::new(bundler::fee::BasicFeeOracle {
+                max_cu_limit: args.max_cu_limit.unwrap_or(1_400_000),
+                min_cu_price: args.min_cu_price.or(args.cu_price).unwrap_or(100),
+                max_cu_price: args.max_cu_price.unwrap_or(5_000),
+            }),
+            FeeOracleCli::Recent => {
+                use bundler::fee_oracles::recent::RecentFeesOracle;
+
+                let probes: Vec<Pubkey> = args
+                    .probe_accounts
+                    .as_deref()
+                    .unwrap_or("")
+                    .split(',')
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| Pubkey::from_str(s.trim()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| anyhow!("invalid --probe-accounts list"))?;
+
+                let mut o = RecentFeesOracle::new(rpc.clone(), probes);
+                if let Some(v) = args.max_cu_limit {
+                    o.max_cu_limit = v;
+                }
+                if let Some(v) = args.min_cu_price.or(args.cu_price) {
+                    o.min_cu_price = v;
+                }
+                if let Some(v) = args.max_cu_price {
+                    o.max_cu_price = v;
+                }
+                if let Some(v) = args.fee_pctile {
+                    o.p_primary = v;
+                }
+                if let Some(v) = args.fee_alpha {
+                    o.ema_alpha = v;
+                }
+                if let Some(v) = args.fee_hysteresis_bps {
+                    o.hysteresis_bps = v;
+                }
+                Box::new(o)
+            }
+        };
+
+        let sender = {
+            let mut s = ReliableSender::with_scope(rpc.clone(), fee_oracle, args.cu_scope.into());
+            if args.fast_send {
+                s = s.with_fast_send();
+            }
+            Arc::new(s)
+        };
+
+        let concurrency = args.concurrency.clamp(1, 12);
+        let parallel_cfg_template = ParallelLayerConfig {
+            max_concurrency: concurrency,
+            max_attempts: 3,
+            base_backoff: Duration::from_millis(200),
+            max_backoff: Duration::from_millis(1_500),
+            dry_run: args.dry_run,
+        };
+
+        let dag_start = Instant::now();
+        let dag = {
+            let span = tracing::info_span!("dag.build", intents_total = intents.len());
+            let _enter = span.enter();
+            tracing::info!("Building DAG from {} intents", intents.len());
+            Dag::build(intents.clone())
+        };
+        let dag_duration = dag_start.elapsed();
+        tracing::info!("DAG build completed in {:?}", dag_duration);
+
+        let layers = dag.layers().context("topo layers")?;
+        let layer_sizes: Vec<usize> = layers.iter().map(|l| l.len()).collect();
+        tracing::info!("DAG has {} layers: {:?}", layers.len(), layer_sizes);
+
+        Ok(Self {
+            wiretap,
+            rpc_base_url,
+            payer,
+            payer_pubkey,
+            commitment,
+            mock_in_use,
+            rpc,
+            safety,
+            tx_budget,
+            alt_policy,
+            occ_cfg,
+            sender,
+            alt_mgr,
+            account_fetcher,
+            parallel_cfg_template,
+            intents,
+            dag,
+            layers,
+            dag_duration,
+            blockhash_policy,
+            blockhash_pre_check,
+            er_context,
+        })
+    }
+
+    fn build_er_context(&self) -> Option<ErRuntimeContext> {
+        self.er_context.clone()
+    }
+
+    fn build_baseline_context(&self) -> BaselineRuntimeContext {
+        let manager = Arc::new(BlockhashManager::new(
+            self.rpc.clone(),
+            self.commitment.clone(),
+            self.blockhash_policy.clone(),
+            self.blockhash_pre_check,
+        ));
+        BaselineRuntimeContext {
+            blockhash_manager: manager,
+        }
+    }
+}
+
+async fn run_er_once(args: &Args, setup: &mut SharedSetup) -> Result<(ErRunResult, TracingReport)> {
+    let er_ctx = setup
+        .build_er_context()
+        .ok_or_else(|| anyhow!("ER context unavailable; rerun with --er-enabled"))?;
+
+    tracing::info!(
+        "Starting rollup processing with {} layers",
+        setup.layers.len()
+    );
+
+    let mut rollup_reports: Vec<TxCost> = Vec::new();
+    let mut er_signatures: Vec<String> = Vec::new();
+    let mut layer_summaries: Vec<LayerSummary> = Vec::new();
+    let mut er_chunk_rows: Vec<ErChunkSummaryRow> = Vec::new();
+    let mut er_total_latency = Duration::ZERO;
+    let mut er_latency_samples: Vec<Duration> = Vec::new();
+    let mut er_exec_samples: Vec<Duration> = Vec::new();
+    let mut er_cu_total: u64 = 0;
+    let mut er_fee_total: u64 = 0;
+    let mut er_chunks_total = 0usize;
+    let mut er_plan_fingerprint_real = 0usize;
+    let mut er_real_chunks = 0usize;
+    let mut er_simulated_chunks = 0usize;
+
+    let sender = setup.sender.clone();
+    let safety = setup.safety.clone();
+    let tx_budget = setup.tx_budget.clone();
+    let alt_policy = setup.alt_policy.clone();
+    let parallel_cfg_template = setup.parallel_cfg_template.clone();
+
+    let parallel_deps = ParallelLayerDeps {
+        sender: sender.clone(),
+        payer: setup.payer.clone(),
+        safety: safety.clone(),
+        alt_manager: setup.alt_mgr.clone(),
+        occ_fetcher: setup.account_fetcher.clone(),
+        occ_config: setup.occ_cfg.clone(),
+        blockhash_provider: er_ctx.blockhash_provider.clone(),
+        er: er_ctx.er_ctx_opt.clone(),
+    };
+
+    for (layer_index, layer) in setup.layers.iter().enumerate() {
+        let layer_span = tracing::info_span!(
+            "chunking.layer",
+            layer_index = layer_index,
+            layer_size = layer.len()
+        );
+        let _guard = layer_span.enter();
+
+        tracing::info!(
+            "Processing layer {} with {} intents",
+            layer_index,
+            layer.len()
+        );
+        sender.start_scope();
+
+        let chunking_start = Instant::now();
+        let planned_chunks = chunk_layer_with(
+            layer,
+            &setup.dag.nodes,
+            &tx_budget,
+            &alt_policy,
+            &ChunkOracle,
+        )?;
+        let chunking_duration = chunking_start.elapsed();
+        tracing::info!(
+            "Chunking layer {} took {:?}, produced {} chunks",
+            layer_index,
+            chunking_duration,
+            planned_chunks.len()
+        );
+
+        let mut chunk_plans = Vec::with_capacity(planned_chunks.len());
+        for (chunk_idx, planned) in planned_chunks.iter().enumerate() {
+            let chunk_intents: Vec<UserIntent> = planned
+                .node_ids
+                .iter()
+                .map(|&nid| setup.dag.nodes[nid as usize].clone())
+                .collect();
+            tracing::info!(
+                target: "planner",
+                chunk_index = chunk_idx,
+                node_count = planned.node_ids.len(),
+                est_cu = planned.est_cu,
+                est_msg_bytes = planned.est_message_bytes,
+                alt_ro = planned.alt_readonly,
+                alt_wr = planned.alt_writable,
+                "planned chunk"
+            );
+            chunk_plans.push(ChunkPlan {
+                index: chunk_idx,
+                intents: chunk_intents,
+                estimates: ChunkEstimates {
+                    est_cu: planned.est_cu,
+                    est_msg_bytes: planned.est_message_bytes,
+                    alt_ro_count: planned.alt_readonly,
+                    alt_wr_count: planned.alt_writable,
+                },
+                merged_indices: Vec::new(),
+            });
+        }
+
+        let mut cfg = parallel_cfg_template.clone();
+        if chunk_plans.len() <= 1 {
+            cfg.max_concurrency = 1;
+        }
+        let use_parallel = cfg.max_concurrency > 1 && chunk_plans.len() > 1;
+
+        let LayerResult {
+            layer_index: _,
+            wall_clock,
+            chunks,
+        } = send_layer_parallel(layer_index, chunk_plans, parallel_deps.clone(), cfg).await;
+
+        let mut layer_success = 0usize;
+        let mut layer_failure = 0usize;
+        let mut simulate_durations: Vec<Duration> = Vec::new();
+        let mut send_durations: Vec<Duration> = Vec::new();
+
+        for chunk in chunks {
+            let chunk_er_diag = chunk.er.clone();
+            let chunk_index = chunk.index;
+            let chunk_attempts = chunk.attempts;
+            let chunk_timings = chunk.timings;
+            let chunk_estimates = chunk.estimates.clone();
+
+            match chunk.outcome {
+                bundler::pipeline::rollup::ChunkOutcome::Success(success) => {
+                    layer_success += 1;
+                    simulate_durations.push(success.report.simulate_duration);
+                    if let Some(send_dur) = success.report.send_duration {
+                        send_durations.push(send_dur);
+                    }
+
+                    let mut fallback_reason = chunk_er_diag.fallback_reason.clone();
+                    if !chunk_er_diag.session_established {
+                        if fallback_reason.is_none() {
+                            let inferred = if !chunk_er_diag.er_ctx_present {
+                                "context_absent"
+                            } else if !chunk_er_diag.er_enabled {
+                                "er_disabled_by_config"
+                            } else if !chunk_er_diag.attempted {
+                                "er_not_attempted"
+                            } else {
+                                "unspecified (inspect logs)"
+                            };
+                            fallback_reason = Some(inferred.to_string());
+                        }
+                    }
+
+                    let decision = if chunk_er_diag.session_established {
+                        "ran_er"
+                    } else if chunk_er_diag.simulated {
+                        "simulated_er"
+                    } else {
+                        "fell_back"
+                    };
+
+                    if let Some(ref tm) = er_ctx.er_metrics {
+                        let sum = tm.summary();
+                        if let Some(code) = sum.last_router_error_code {
+                            let meaning = json_rpc_code_meaning(code);
+                            tracing::info!(
+                                target: "er.context",
+                                layer_index,
+                                chunk_index,
+                                last_router_error_code = code,
+                                last_router_error_meaning = %meaning,
+                                last_router_error_message = %sum
+                                    .last_router_error_message
+                                    .as_deref()
+                                    .unwrap_or("-"),
+                                "router last JSON-RPC error snapshot"
+                            );
+                        }
+                    }
+
+                    if success.plan_fingerprint.is_some() && chunk_er_diag.session_established {
+                        er_plan_fingerprint_real += 1;
+                    }
+
+                    if chunk_er_diag.session_established {
+                        er_real_chunks += 1;
+                        er_chunks_total += 1;
+                        er_cu_total += success.report.used_cu as u64;
+                        er_fee_total += success.report.total_fee_lamports;
+                        er_total_latency += chunk_timings.total;
+                        er_latency_samples.push(chunk_timings.total);
+                        if let Some(exec_dur) = success.er_execution_duration {
+                            er_exec_samples.push(exec_dur);
+                        }
+                    } else if chunk_er_diag.simulated {
+                        er_simulated_chunks += 1;
+                    }
+
+                    let sig_section = signatures_section_len(success.report.required_signers);
+                    let packet_bytes = success.report.message_bytes + sig_section;
+                    let max_msg_budget =
+                        safety.max_message_bytes_with_signers(success.report.required_signers);
+                    let max_packet_bytes = max_msg_budget + sig_section;
+                    let guard_pass = success.report.message_bytes <= max_msg_budget;
+                    let er_execution_ms_opt = success.er_execution_duration.map(|d| d.as_millis());
+
+                    tracing::info!(
+                        target: "er.decide",
+                        layer_index,
+                        chunk_index = chunk_index,
+                        er_enabled = args.er_enabled,
+                        er_ctx_present = chunk_er_diag.er_ctx_present,
+                        er_attempted = chunk_er_diag.attempted,
+                        er_simulated = chunk_er_diag.simulated,
+                        er_execution_duration_ms = er_execution_ms_opt,
+                        plan_fingerprint_present = success.plan_fingerprint.is_some(),
+                        used_cu = success.report.used_cu,
+                        final_cu_limit = success.report.final_plan.cu_limit,
+                        final_cu_price = success.report.final_plan.cu_price_microlamports,
+                        message_bytes = success.report.message_bytes,
+                        alt_keys_offloaded = success.alt_resolution.stats.keys_offloaded,
+                        guard_pass,
+                        decision = decision,
+                        fallback_reason = fallback_reason.as_deref(),
+                        route_endpoint = chunk_er_diag.route_endpoint.as_deref(),
+                        "ER per-chunk decision"
+                    );
+
+                    er_chunk_rows.push(ErChunkSummaryRow {
+                        layer: layer_index,
+                        chunk: chunk_index,
+                        decision: decision.to_string(),
+                        reason: fallback_reason.clone(),
+                        route: chunk_er_diag.route_endpoint.clone(),
+                        total_ms: chunk_timings.total.as_millis(),
+                        exec_ms: er_execution_ms_opt,
+                        used_cu: success.report.used_cu,
+                        er_attempted: chunk_er_diag.attempted,
+                        session_established: chunk_er_diag.session_established,
+                    });
+
+                    if let Some(sig) = success.er_signature.as_ref() {
+                        er_signatures.push(sig.clone());
+                    }
+
+                    tracing::info!(
+                        target: "pipeline",
+                        layer_index,
+                        chunk_index = chunk_index,
+                        attempts = chunk_attempts,
+                        total_ms = chunk_timings.total.as_millis(),
+                        simulate_ms = success.report.simulate_duration.as_millis(),
+                        send_ms = success.report.send_duration.map(|d| d.as_millis()).unwrap_or(0),
+                        est_cu = chunk_estimates.est_cu,
+                        est_msg_bytes = chunk_estimates.est_msg_bytes,
+                        alt_keys = success.alt_resolution.stats.keys_offloaded,
+                        alt_saved_bytes = success.alt_resolution.stats.estimated_saved_bytes,
+                        last_valid_block_height = success.lease.last_valid_block_height,
+                        "chunk completed"
+                    );
+
+                    if let Some(sig) = &success.report.signature {
+                        tracing::info!(
+                            target: "pipeline",
+                            layer_index,
+                            chunk_index = chunk_index,
+                            sig = %sig,
+                            "transaction sent"
+                        );
+                    }
+
+                    rollup_reports.push(TxCost {
+                        signature: success.report.signature.map(|s| s.to_string()),
+                        used_cu: success.report.used_cu,
+                        cu_limit: success.report.final_plan.cu_limit,
+                        cu_price_micro_lamports: success.report.final_plan.cu_price_microlamports,
+                        message_bytes: success.report.message_bytes,
+                        required_signers: success.report.required_signers,
+                        packet_bytes,
+                        max_packet_bytes,
+                        packet_guard_pass: guard_pass,
+                        base_fee_lamports: success.report.base_fee_lamports,
+                        priority_fee_lamports: success.report.priority_fee_lamports,
+                        total_fee_lamports: success.report.total_fee_lamports,
+                    });
+                }
+                bundler::pipeline::rollup::ChunkOutcome::Failed {
+                    error,
+                    retriable,
+                    stage,
+                } => {
+                    layer_failure += 1;
+                    tracing::error!(
+                        target: "pipeline",
+                        layer_index,
+                        chunk_index = chunk_index,
+                        attempts = chunk_attempts,
+                        retriable,
+                        ?stage,
+                        est_cu = chunk_estimates.est_cu,
+                        est_msg_bytes = chunk_estimates.est_msg_bytes,
+                        est_alt_ro = chunk_estimates.alt_ro_count,
+                        est_alt_wr = chunk_estimates.alt_wr_count,
+                        "chunk failed: {error:?}"
+                    );
+                }
+            }
+        }
+
+        let p95_sim = percentile_duration(&mut simulate_durations, 0.95);
+        let p95_send = percentile_duration(&mut send_durations, 0.95);
+
+        tracing::info!(
+            target: "pipeline",
+            layer_index,
+            use_parallel,
+            chunks_total = layer_success + layer_failure,
+            chunks_success = layer_success,
+            chunks_failed = layer_failure,
+            wall_clock_ms = wall_clock.as_millis(),
+            p95_sim_ms = p95_sim.map(|d| d.as_millis()).unwrap_or(0),
+            p95_send_ms = p95_send.map(|d| d.as_millis()).unwrap_or(0),
+            "layer execution complete"
+        );
+
+        layer_summaries.push(LayerSummary {
+            index: layer_index,
+            chunks: layer_success + layer_failure,
+            success: layer_success,
+            failure: layer_failure,
+            wall_clock,
+        });
+
+        er_ctx.blockhash_manager.mark_layer_boundary();
+    }
+
+    let telemetry_summary = er_ctx.er_metrics.as_ref().map(|metrics| metrics.summary());
+
+    if let Some(summary) = &telemetry_summary {
+        let total_routes = summary.routes_ok + summary.routes_err;
+        let discovery_success_rate = if total_routes > 0 {
+            summary.routes_ok as f64 / total_routes as f64
+        } else {
+            0.0
+        };
+        let total_cache_lookups = summary.router_cache_hits + summary.router_cache_misses;
+        let cache_hit_rate = if total_cache_lookups > 0 {
+            summary.router_cache_hits as f64 / total_cache_lookups as f64
+        } else {
+            0.0
+        };
+        let total_blockhash_cache = summary.blockhash_cache_hits + summary.blockhash_cache_misses;
+        let blockhash_cache_hit_rate = if total_blockhash_cache > 0 {
+            summary.blockhash_cache_hits as f64 / total_blockhash_cache as f64
+        } else {
+            0.0
+        };
+
+        tracing::info!(
+            target: "er",
+            er_sessions = summary.sessions,
+            er_successes = summary.successes,
+            fallback_count = summary.fallbacks,
+            fallback_rate = if summary.sessions > 0 {
+                summary.fallbacks as f64 / summary.sessions as f64
+            } else {
+                0.0
+            },
+            routes_ok = summary.routes_ok,
+            routes_err = summary.routes_err,
+            discovery_success_rate,
+            cache_hit_rate,
+            cache_hits = summary.router_cache_hits,
+            cache_misses = summary.router_cache_misses,
+            blockhash_cache_hit_rate,
+            blockhash_cache_hits = summary.blockhash_cache_hits,
+            blockhash_cache_misses = summary.blockhash_cache_misses,
+            bhfa_ok = summary.bhfa_ok,
+            bhfa_err = summary.bhfa_err,
+            route_ms_p50 = summary.route_ms_p50.unwrap_or(0.0),
+            route_ms_p95 = summary.route_ms_p95.unwrap_or(0.0),
+            bhfa_ms_p50 = summary.bhfa_ms_p50.unwrap_or(0.0),
+            bhfa_ms_p95 = summary.bhfa_ms_p95.unwrap_or(0.0),
+            er_success_rate = summary.success_rate,
+            router_simulate = summary.router_simulate,
+            router_send = summary.router_send,
+            skipped_small_chunks = summary.small_chunk_skips,
+            merged_small_chunks = summary.merged_small_chunks,
+            er_real_chunks,
+            er_simulated_chunks,
+            "ER aggregate metrics"
+        );
+    }
+
+    let er_latency_stats = build_duration_stats(&er_latency_samples);
+    let er_exec_stats = build_duration_stats(&er_exec_samples);
+    let plan_fingerprint_coverage = if er_chunks_total > 0 {
+        er_plan_fingerprint_real as f64 / er_chunks_total as f64
+    } else {
+        0.0
+    };
+
+    let router_health_summary = telemetry_summary.as_ref().map(router_health_from_summary);
+
+    let er_success_rate = telemetry_summary
+        .as_ref()
+        .map(|s| s.success_rate)
+        .unwrap_or(0.0);
+    let er_fallback_rate = telemetry_summary
+        .as_ref()
+        .map(|s| {
+            if s.sessions > 0 {
+                s.fallbacks as f64 / s.sessions as f64
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
+
+    let blockhash_metrics = er_ctx.blockhash_manager.metrics();
+    let alt_metrics = setup.alt_mgr.metrics();
+    let occ_metrics = occ_metrics_snapshot();
+    let rpc_metrics = global_rpc_metrics_snapshot();
+
+    let run_mode = match args.cu_scope {
+        CuScopeCli::Global => "default".to_string(),
+        CuScopeCli::PerLayer => "per-layer".to_string(),
+    };
+    let rollup_total_ms: u64 = layer_summaries
+        .iter()
+        .map(|s| s.wall_clock.as_millis() as u64)
+        .sum();
+    let tracing_report = TracingReport {
+        run_mode,
+        stages: vec![
+            StageMetric {
+                name: "dag.build".to_string(),
+                count: 1,
+                total_ms: setup.dag_duration.as_millis() as u64,
+            },
+            StageMetric {
+                name: "rollup.execution".to_string(),
+                count: rollup_reports.len() as u64,
+                total_ms: rollup_total_ms,
+            },
+        ],
+        rpc: rpc_metrics.clone(),
+        mock_in_use: setup.mock_in_use,
+        rpc_url: setup.rpc_base_url.clone(),
+    };
+
+    let result = ErRunResult {
+        rollup_reports,
+        signatures: er_signatures,
+        layer_summaries,
+        er_chunk_rows,
+        dag_layer_sizes: setup.layers.iter().map(|layer| layer.len()).collect(),
+        dag_node_count: setup.dag.nodes.len(),
+        dag_duration: setup.dag_duration,
+        er_real_chunks,
+        er_simulated_chunks,
+        er_cu_total,
+        er_fee_total,
+        er_latency_stats,
+        er_exec_stats,
+        plan_fingerprint_coverage,
+        er_success_rate,
+        er_fallback_rate,
+        router_health_summary,
+        telemetry_summary,
+        blockhash_metrics,
+        alt_metrics,
+        occ_metrics,
+        rpc_metrics,
+    };
+
+    Ok((result, tracing_report))
+}
+
+async fn run_baseline_once(
+    args: &Args,
+    setup: &SharedSetup,
+    baseline_ctx: BaselineRuntimeContext,
+) -> Result<(BaselineRunResult, TracingReport)> {
+    tracing::info!(
+        "Starting baseline processing for {} intents",
+        setup.intents.len()
+    );
+
+    let mut baseline_reports: Vec<TxCost> = Vec::new();
+    let mut baseline_signatures: Vec<String> = Vec::new();
+    let mut baseline_latency_samples: Vec<Duration> = Vec::new();
+    let mut baseline_total_latency = Duration::ZERO;
+    let mut blockhash_stats = BaselineBlockhashStats::default();
+
+    let blockhash_manager = baseline_ctx.blockhash_manager.clone();
+
+    for (i, ui) in setup.intents.iter().cloned().enumerate() {
+        let lease = blockhash_manager.lease().await?;
+        let mut bh = lease.hash;
+        blockhash_stats.rpc_fallback += 1;
+
+        let mut build = make_build_vmsg(
+            setup.payer_pubkey,
+            &mut bh,
+            AltResolution::default(),
+            vec![ui.clone()],
+            setup.safety.clone(),
+            setup.rpc.clone(),
+            setup.commitment.clone(),
+        );
+        let rep_res = setup.sender.simulate_build_and_send_with_report(
+            &mut build,
+            &[setup.payer.as_ref()],
+            args.dry_run,
+        );
+
+        let rep = match rep_res {
+            Ok(value) => {
+                blockhash_manager.record_outcome(&lease, LeaseOutcome::Success);
+                value
+            }
+            Err(err) => {
+                blockhash_manager.record_outcome(&lease, LeaseOutcome::StaleDetected);
+                return Err(err.into());
+            }
+        };
+
+        let sig_section = signatures_section_len(rep.required_signers);
+        let packet_bytes = rep.message_bytes + sig_section;
+        let max_msg_budget = setup
+            .safety
+            .max_message_bytes_with_signers(rep.required_signers);
+        let max_packet_bytes = max_msg_budget + sig_section;
+        let guard_pass = rep.message_bytes <= max_msg_budget;
+
+        let tx_latency = rep.simulate_duration + rep.send_duration.unwrap_or_default();
+
+        let signature = rep.signature.map(|s| s.to_string());
+        if let Some(sig) = signature.as_ref() {
+            baseline_signatures.push(sig.clone());
+        }
+
+        baseline_reports.push(TxCost {
+            signature,
+            used_cu: rep.used_cu,
+            cu_limit: rep.final_plan.cu_limit,
+            cu_price_micro_lamports: rep.final_plan.cu_price_microlamports,
+            message_bytes: rep.message_bytes,
+            required_signers: rep.required_signers,
+            packet_bytes,
+            max_packet_bytes,
+            packet_guard_pass: guard_pass,
+            base_fee_lamports: rep.base_fee_lamports,
+            priority_fee_lamports: rep.priority_fee_lamports,
+            total_fee_lamports: rep.total_fee_lamports,
+        });
+        baseline_total_latency += tx_latency;
+        baseline_latency_samples.push(tx_latency);
+
+        if (i + 1) % 10 == 0 || i == setup.intents.len() - 1 {
+            tracing::info!("Baseline progress: {}/{}", i + 1, setup.intents.len());
+        }
+    }
+
+    let baseline_latency_stats = build_duration_stats(&baseline_latency_samples);
+    let fee_total: u64 = baseline_reports.iter().map(|x| x.total_fee_lamports).sum();
+    let fee_avg = if baseline_reports.is_empty() {
+        None
+    } else {
+        Some(fee_total as f64 / baseline_reports.len() as f64)
+    };
+
+    let rpc_metrics = global_rpc_metrics_snapshot();
+    let blockhash_metrics = blockhash_manager.metrics();
+
+    let run_mode = match args.cu_scope {
+        CuScopeCli::Global => "default".to_string(),
+        CuScopeCli::PerLayer => "per-layer".to_string(),
+    };
+    let tracing_report = TracingReport {
+        run_mode,
+        stages: vec![
+            StageMetric {
+                name: "dag.build".to_string(),
+                count: 1,
+                total_ms: setup.dag_duration.as_millis() as u64,
+            },
+            StageMetric {
+                name: "baseline.execution".to_string(),
+                count: baseline_reports.len() as u64,
+                total_ms: baseline_latency_samples
+                    .iter()
+                    .map(|d| d.as_millis() as u64)
+                    .sum(),
+            },
+        ],
+        rpc: rpc_metrics.clone(),
+        mock_in_use: setup.mock_in_use,
+        rpc_url: setup.rpc_base_url.clone(),
+    };
+
+    let result = BaselineRunResult {
+        baseline_reports,
+        signatures: baseline_signatures,
+        dag_layer_sizes: setup.layers.iter().map(|layer| layer.len()).collect(),
+        dag_node_count: setup.dag.nodes.len(),
+        dag_duration: setup.dag_duration,
+        fee_total,
+        fee_avg,
+        tx_count: setup.intents.len(),
+        latency_stats: baseline_latency_stats,
+        rpc_metrics,
+        blockhash_metrics,
+        blockhash_stats,
+    };
+
+    Ok((result, tracing_report))
+}
+
+fn build_duration_stats(samples: &[Duration]) -> DurationStats {
+    if samples.is_empty() {
+        return DurationStats::default();
+    }
+    let mut sorted = samples.to_vec();
+    let p50 = percentile_duration(&mut sorted, 0.50);
+    let p95 = percentile_duration(&mut sorted, 0.95);
+    let (variance, stddev) = duration_variance_stddev(samples);
+
+    DurationStats {
+        p50_ms: duration_to_ms(p50),
+        p95_ms: duration_to_ms(p95),
+        stddev_ms: stddev,
+        variance_ms: variance,
+    }
+}
+
+fn router_health_from_summary(summary: &bundler::er::ErTelemetrySummary) -> RouterHealthSummary {
+    let discovery_total = summary.routes_ok + summary.routes_err;
+    let discovery_success_rate = if discovery_total > 0 {
+        summary.routes_ok as f64 / discovery_total as f64
+    } else {
+        0.0
+    };
+    let cache_total = summary.router_cache_hits + summary.router_cache_misses;
+    let cache_hit_rate = if cache_total > 0 {
+        summary.router_cache_hits as f64 / cache_total as f64
+    } else {
+        0.0
+    };
+    let blockhash_cache_total = summary.blockhash_cache_hits + summary.blockhash_cache_misses;
+    let blockhash_cache_hit_rate = if blockhash_cache_total > 0 {
+        summary.blockhash_cache_hits as f64 / blockhash_cache_total as f64
+    } else {
+        0.0
+    };
+
+    RouterHealthSummary {
+        discovery_success_rate,
+        discovery_p50_ms: summary.route_ms_p50,
+        discovery_p95_ms: summary.route_ms_p95,
+        cache_hit_rate,
+        cache_hits: summary.router_cache_hits,
+        cache_misses: summary.router_cache_misses,
+        blockhash_cache_hit_rate,
+        blockhash_cache_hits: summary.blockhash_cache_hits,
+        blockhash_cache_misses: summary.blockhash_cache_misses,
+        error_counts: summary.router_error_kinds.clone(),
+        blockhash_p50_ms: summary.bhfa_ms_p50,
+        blockhash_p95_ms: summary.bhfa_ms_p95,
+    }
+}
+
+fn rpc_metrics_diff(
+    after: &bundler::sender::RpcMetrics,
+    before: &bundler::sender::RpcMetrics,
+) -> bundler::sender::RpcMetrics {
+    bundler::sender::RpcMetrics {
+        simulate: after.simulate.saturating_sub(before.simulate),
+        is_blockhash_valid: after
+            .is_blockhash_valid
+            .saturating_sub(before.is_blockhash_valid),
+        get_latest_blockhash: after
+            .get_latest_blockhash
+            .saturating_sub(before.get_latest_blockhash),
+        send_transaction: after
+            .send_transaction
+            .saturating_sub(before.send_transaction),
+        get_recent_prioritization_fees: after
+            .get_recent_prioritization_fees
+            .saturating_sub(before.get_recent_prioritization_fees),
+    }
+}
+
+fn print_tracing_report(label: &str, report: &TracingReport) -> Result<()> {
+    println!("=== TRACING REPORT JSON ({label}) ===");
+    println!("{}", serde_json::to_string_pretty(report)?);
+    Ok(())
+}
+
+fn print_rpc_metrics_table(title: &str, metrics: &bundler::sender::RpcMetrics) {
+    println!("\n=== {title} ===");
+    println!("| Metric                     | Count |");
+    println!("|----------------------------|-------|");
+    println!("| simulateTransaction        | {:5} |", metrics.simulate);
+    println!(
+        "| isBlockhashValid           | {:5} |",
+        metrics.is_blockhash_valid
+    );
+    println!(
+        "| getLatestBlockhash         | {:5} |",
+        metrics.get_latest_blockhash
+    );
+    println!(
+        "| getRecentPrioritizationFees| {:5} |",
+        metrics.get_recent_prioritization_fees
+    );
+    println!(
+        "| sendTransaction            | {:5} |",
+        metrics.send_transaction
+    );
+}
+
+fn print_signature_preview(signatures: &[String]) {
+    if signatures.is_empty() {
+        println!("Signatures (first 5): <none>");
+        return;
+    }
+
+    let shown = signatures
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remaining = signatures.len().saturating_sub(5);
+    if remaining > 0 {
+        println!("Signatures (first 5): {} (+{} more)", shown, remaining);
+    } else {
+        println!("Signatures (first 5): {shown}");
+    }
+}
+
+fn print_layer_summaries(layer_summaries: &[LayerSummary]) {
+    if layer_summaries.is_empty() {
+        return;
+    }
+    println!("\n=== LAYER SUMMARIES ===");
+    for summary in layer_summaries {
+        println!(
+            "layer {:02}: chunks={} success={} failure={} wall_clock_ms={}",
+            summary.index,
+            summary.chunks,
+            summary.success,
+            summary.failure,
+            summary.wall_clock.as_millis()
+        );
+    }
+}
+
+fn print_er_chunk_summary(rows: &[ErChunkSummaryRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!("\n=== ER CHUNK SUMMARY ===");
+    println!(
+        "{:<5} {:<6} {:<16} {:<28} {:<40} {:>12} {:>16}",
+        "Layer", "Chunk", "Decision", "Reason", "Route", "Total (ms)", "ER execute (ms)"
+    );
+    for row in rows {
+        let decision = truncate_cell(&row.decision, 16);
+        let reason = truncate_cell(row.reason.as_deref().unwrap_or("-"), 28);
+        let route = truncate_cell(row.route.as_deref().unwrap_or("-"), 40);
+        let exec_cell = row
+            .exec_ms
+            .map(|ms| ms.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<5} {:<6} {:<16} {:<28} {:<40} {:>12} {:>16}",
+            row.layer, row.chunk, decision, reason, route, row.total_ms, exec_cell
+        );
+    }
+}
+
+fn print_alt_metrics(metrics: &bundler::alt::AltMetrics) {
+    println!("\n=== ALT METRICS ===");
+    println!("resolutions               : {}", metrics.total_resolutions);
+    let hit_pct = if metrics.total_resolutions > 0 {
+        (metrics.cache_hits as f64 * 100.0) / (metrics.total_resolutions as f64)
+    } else {
+        0.0
+    };
+    println!(
+        "cache_hits                : {} ({:.2}%)",
+        metrics.cache_hits, hit_pct
+    );
+    println!("keys_offloaded            : {}", metrics.keys_offloaded);
+    println!("readonly_offloaded        : {}", metrics.readonly_offloaded);
+    println!("writable_offloaded        : {}", metrics.writable_offloaded);
+    println!(
+        "estimated_bytes_saved     : {}",
+        metrics.estimated_saved_bytes
+    );
+}
+
+fn print_occ_metrics(metrics: &bundler::occ::OccMetrics) {
+    println!("\n=== OCC METRICS ===");
+    println!("captures                  : {}", metrics.captures);
+    println!("retries                   : {}", metrics.retries);
+    println!("slot_drift_rejects        : {}", metrics.slot_drift_rejects);
+    println!("rpc_errors                : {}", metrics.rpc_errors);
+}
+
+fn print_blockhash_manager_metrics(metrics: &bundler::pipeline::blockhash::BlockhashMetrics) {
+    println!("\n=== ER BLOCKHASH MANAGER METRICS ===");
+    println!("refresh_initial            : {}", metrics.refresh_initial);
+    println!("refresh_manual             : {}", metrics.refresh_manual);
+    println!("refresh_age                : {}", metrics.refresh_age);
+    println!("refresh_quota              : {}", metrics.refresh_quota);
+    println!("refresh_layer              : {}", metrics.refresh_layer);
+    println!(
+        "refresh_validation_failed  : {}",
+        metrics.refresh_validation
+    );
+    println!("leases_issued              : {}", metrics.leases_issued);
+    let stale_pct = if metrics.leases_issued > 0 {
+        (metrics.stale_detected as f64 * 100.0) / (metrics.leases_issued as f64)
+    } else {
+        0.0
+    };
+    println!(
+        "stale_detected            : {} ({:.3}%)",
+        metrics.stale_detected, stale_pct
+    );
+}
+
+fn print_er_blockhash_summary(summary: Option<&bundler::er::ErTelemetrySummary>) {
+    println!("\n=== ER BLOCKHASH SUMMARY ===");
+    if let Some(summary) = summary {
+        println!("bhfa_ok                   : {}", summary.bhfa_ok);
+        println!("bhfa_err                  : {}", summary.bhfa_err);
+        println!(
+            "blockhash cache hit rate   : {:.2}% ({} hits / {} misses)",
+            if summary.blockhash_cache_hits + summary.blockhash_cache_misses > 0 {
+                (summary.blockhash_cache_hits as f64
+                    / (summary.blockhash_cache_hits + summary.blockhash_cache_misses) as f64)
+                    * 100.0
+            } else {
+                0.0
+            },
+            summary.blockhash_cache_hits,
+            summary.blockhash_cache_misses
+        );
+        println!(
+            "router blockhash plan hits : {}",
+            summary.blockhash_plan_hits
+        );
+        println!(
+            "router blockhash plan miss : {}",
+            summary.blockhash_plan_misses
+        );
+        println!(
+            "bhfa latency p50/p95 (ms)  : {}/{}",
+            fmt_opt_f64(summary.bhfa_ms_p50),
+            fmt_opt_f64(summary.bhfa_ms_p95)
+        );
+    } else {
+        println!("ER telemetry unavailable; blockhash summary not collected.");
+    }
+}
+
+fn print_baseline_blockhash_summary(stats: &BaselineBlockhashStats) {
+    println!("\n=== BASELINE BLOCKHASH SOURCES ===");
+    println!("bhfa_ok                   : {}", stats.bhfa_ok);
+    println!("bhfa_err                  : {}", stats.bhfa_err);
+    println!("rpc_fallbacks             : {}", stats.rpc_fallback);
+}
+
+fn blockhash_metrics_json(
+    metrics: &bundler::pipeline::blockhash::BlockhashMetrics,
+) -> serde_json::Value {
+    json!({
+        "refresh_initial": metrics.refresh_initial,
+        "refresh_manual": metrics.refresh_manual,
+        "refresh_age": metrics.refresh_age,
+        "refresh_quota": metrics.refresh_quota,
+        "refresh_layer": metrics.refresh_layer,
+        "refresh_validation": metrics.refresh_validation,
+        "leases_issued": metrics.leases_issued,
+        "stale_detected": metrics.stale_detected,
+    })
+}
+
+fn alt_metrics_json(metrics: &bundler::alt::AltMetrics) -> serde_json::Value {
+    json!({
+        "total_resolutions": metrics.total_resolutions,
+        "cache_hits": metrics.cache_hits,
+        "keys_offloaded": metrics.keys_offloaded,
+        "readonly_offloaded": metrics.readonly_offloaded,
+        "writable_offloaded": metrics.writable_offloaded,
+        "estimated_saved_bytes": metrics.estimated_saved_bytes,
+    })
+}
+
+fn occ_metrics_json(metrics: &bundler::occ::OccMetrics) -> serde_json::Value {
+    json!({
+        "captures": metrics.captures,
+        "retries": metrics.retries,
+        "slot_drift_rejects": metrics.slot_drift_rejects,
+        "rpc_errors": metrics.rpc_errors,
+    })
+}
+
+fn er_telemetry_json(summary: &bundler::er::ErTelemetrySummary) -> serde_json::Value {
+    json!({
+        "sessions": summary.sessions,
+        "successes": summary.successes,
+        "fallbacks": summary.fallbacks,
+        "routes_ok": summary.routes_ok,
+        "routes_err": summary.routes_err,
+        "bhfa_ok": summary.bhfa_ok,
+        "bhfa_err": summary.bhfa_err,
+        "exec_ok": summary.exec_ok,
+        "exec_err": summary.exec_err,
+        "route_ms_p50": summary.route_ms_p50,
+        "route_ms_p95": summary.route_ms_p95,
+        "bhfa_ms_p50": summary.bhfa_ms_p50,
+        "bhfa_ms_p95": summary.bhfa_ms_p95,
+        "exec_ms_p50": summary.exec_ms_p50,
+        "exec_ms_p95": summary.exec_ms_p95,
+        "success_rate": summary.success_rate,
+        "router_simulate": summary.router_simulate,
+        "router_send": summary.router_send,
+        "router_cache_hits": summary.router_cache_hits,
+        "router_cache_misses": summary.router_cache_misses,
+        "router_error_kinds": summary.router_error_kinds,
+        "session_begin_attempts": summary.session_begin_attempts,
+        "session_begin_ok": summary.session_begin_ok,
+        "session_begin_err": summary.session_begin_err,
+        "last_router_error_code": summary.last_router_error_code,
+        "last_router_error_message": summary.last_router_error_message,
+        "blockhash_cache_hits": summary.blockhash_cache_hits,
+        "blockhash_cache_misses": summary.blockhash_cache_misses,
+        "small_chunk_skips": summary.small_chunk_skips,
+        "merged_small_chunks": summary.merged_small_chunks,
+        "dp_begin_ok": summary.dp_begin_ok,
+        "dp_begin_err": summary.dp_begin_err,
+        "dp_execute_ok": summary.dp_execute_ok,
+        "dp_execute_err": summary.dp_execute_err,
+        "dp_end_ok": summary.dp_end_ok,
+        "dp_end_err": summary.dp_end_err,
+        "blockhash_plan_hits": summary.blockhash_plan_hits,
+        "blockhash_plan_misses": summary.blockhash_plan_misses,
+    })
+}
+
+fn print_er_report(args: &Args, result: &ErRunResult, tracing: &TracingReport) -> Result<()> {
+    print_tracing_report("ER", tracing)?;
+
+    println!("\n=== ER RUN REPORT ===");
+    println!("intents                    : {}", result.dag_node_count);
+    println!("dag layers                : {:?}", result.dag_layer_sizes);
+    println!("chunks (executed via ER)   : {}", result.er_real_chunks);
+    println!(
+        "chunks (simulated ER)      : {}",
+        result.er_simulated_chunks
+    );
+    println!("total fee (lamports)       : {}", result.er_fee_total);
+    let er_avg_fee = if result.er_real_chunks > 0 {
+        Some(result.er_fee_total as f64 / result.er_real_chunks as f64)
+    } else {
+        None
+    };
+    println!(
+        "avg fee (lamports)         : {}",
+        er_avg_fee
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "latency p50/p95 (ms)       : {}/{}",
+        fmt_opt_f64(result.er_latency_stats.p50_ms),
+        fmt_opt_f64(result.er_latency_stats.p95_ms)
+    );
+    println!(
+        "latency stddev/variance    : {}/{}",
+        fmt_opt_f64(result.er_latency_stats.stddev_ms),
+        fmt_opt_f64(result.er_latency_stats.variance_ms)
+    );
+    println!(
+        "execute p50/p95 (ms)       : {}/{}",
+        fmt_opt_f64(result.er_exec_stats.p50_ms),
+        fmt_opt_f64(result.er_exec_stats.p95_ms)
+    );
+    println!(
+        "execute stddev/variance    : {}/{}",
+        fmt_opt_f64(result.er_exec_stats.stddev_ms),
+        fmt_opt_f64(result.er_exec_stats.variance_ms)
+    );
+    println!(
+        "plan fingerprint coverage  : {:.2}%",
+        result.plan_fingerprint_coverage * 100.0
+    );
+    println!(
+        "ER success/fallback rate   : {:.3} / {:.3}",
+        result.er_success_rate, result.er_fallback_rate
+    );
+
+    if args.print_sigs {
+        print_signature_preview(&result.signatures);
+    }
+
+    if let Some(router) = &result.router_health_summary {
+        println!("\n=== ER ROUTER HEALTH ===");
+        println!(
+            "discovery success rate    : {:.2}%",
+            router.discovery_success_rate * 100.0
+        );
+        println!(
+            "route latency p50/p95 ms  : {}/{}",
+            fmt_opt_f64(router.discovery_p50_ms),
+            fmt_opt_f64(router.discovery_p95_ms)
+        );
+        println!(
+            "route cache hit rate      : {:.2}% ({} hits / {} misses)",
+            router.cache_hit_rate * 100.0,
+            router.cache_hits,
+            router.cache_misses
+        );
+        println!(
+            "blockhash cache hit rate  : {:.2}% ({} hits / {} misses)",
+            router.blockhash_cache_hit_rate * 100.0,
+            router.blockhash_cache_hits,
+            router.blockhash_cache_misses
+        );
+        println!(
+            "bhfa latency p50/p95 ms   : {}/{}",
+            fmt_opt_f64(router.blockhash_p50_ms),
+            fmt_opt_f64(router.blockhash_p95_ms)
+        );
+        if !router.error_counts.is_empty() {
+            println!("router error kinds         :");
+            for (kind, count) in &router.error_counts {
+                println!("  {kind:<20} {count}");
+            }
+        }
+    }
+
+    print_er_blockhash_summary(result.telemetry_summary.as_ref());
+    print_blockhash_manager_metrics(&result.blockhash_metrics);
+    print_layer_summaries(&result.layer_summaries);
+    print_er_chunk_summary(&result.er_chunk_rows);
+    print_alt_metrics(&result.alt_metrics);
+    print_occ_metrics(&result.occ_metrics);
+    print_rpc_metrics_table("RPC METRICS (up to ER run)", &result.rpc_metrics);
+
+    if args.er_enabled && result.er_real_chunks == 0 {
+        let mut reasons: BTreeSet<String> = BTreeSet::new();
+        for row in &result.er_chunk_rows {
+            if row.session_established {
+                continue;
+            }
+            if let Some(reason) = &row.reason {
+                reasons.insert(reason.clone());
+            } else if row.er_attempted {
+                reasons.insert("unspecified (inspect logs)".to_string());
+            }
+        }
+        if result.er_simulated_chunks > 0 {
+            if reasons.is_empty() {
+                println!("note: ER path simulated only; no ER settlements executed.");
+            } else {
+                println!(
+                    "note: ER path simulated only; no ER settlements executed. reasons: {}",
+                    reasons.into_iter().collect::<Vec<_>>().join(" | ")
+                );
+            }
+        } else if reasons.is_empty() {
+            println!("note: ER path unavailable; fell back to direct-to-L1 for all chunks.");
+        } else {
+            println!(
+                "note: ER inactive; {}",
+                reasons.into_iter().collect::<Vec<_>>().join(" | ")
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn print_baseline_report(
+    result: &BaselineRunResult,
+    tracing: &TracingReport,
+    rpc_metrics: &bundler::sender::RpcMetrics,
+    print_sigs: bool,
+) -> Result<()> {
+    print_tracing_report("Baseline", tracing)?;
+
+    println!("\n=== BASELINE RUN REPORT ===");
+    println!("intents                    : {}", result.dag_node_count);
+    println!("dag layers                : {:?}", result.dag_layer_sizes);
+    println!("tx count                  : {}", result.tx_count);
+    println!("total fee (lamports)      : {}", result.fee_total);
+    println!(
+        "avg fee (lamports)        : {}",
+        result
+            .fee_avg
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!(
+        "latency p50/p95 (ms)      : {}/{}",
+        fmt_opt_f64(result.latency_stats.p50_ms),
+        fmt_opt_f64(result.latency_stats.p95_ms)
+    );
+    println!(
+        "latency stddev/variance   : {}/{}",
+        fmt_opt_f64(result.latency_stats.stddev_ms),
+        fmt_opt_f64(result.latency_stats.variance_ms)
+    );
+
+    if print_sigs {
+        print_signature_preview(&result.signatures);
+    }
+
+    print_baseline_blockhash_summary(&result.blockhash_stats);
+    print_rpc_metrics_table("RPC METRICS (baseline run)", rpc_metrics);
+
+    Ok(())
+}
+
+fn print_compare_reports(
+    args: &Args,
+    er_result: &ErRunResult,
+    er_tracing: &TracingReport,
+    baseline_result: &BaselineRunResult,
+    baseline_tracing: &TracingReport,
+) -> Result<()> {
+    print_er_report(args, er_result, er_tracing)?;
+
+    let baseline_rpc_delta = rpc_metrics_diff(&baseline_result.rpc_metrics, &er_result.rpc_metrics);
+    print_baseline_report(
+        baseline_result,
+        baseline_tracing,
+        &baseline_rpc_delta,
+        args.print_sigs,
+    )?;
+
+    println!("\n=== COMPARISON SUMMARY ===");
+    println!(
+        "ER total fee vs baseline   : {} vs {}",
+        er_result.er_fee_total, baseline_result.fee_total
+    );
+    let fee_delta = baseline_result.fee_total as i64 - er_result.er_fee_total as i64;
+    let fee_savings_pct = if baseline_result.fee_total > 0 {
+        (fee_delta as f64 / baseline_result.fee_total as f64) * 100.0
+    } else {
+        0.0
+    };
+    println!(
+        "fee savings (lamports/% ) : {} ({:.2}%)",
+        fee_delta, fee_savings_pct
+    );
+
+    let er_cu_avg = if er_result.er_real_chunks > 0 {
+        Some(er_result.er_cu_total as f64 / er_result.er_real_chunks as f64)
+    } else {
+        None
+    };
+    let baseline_cu_total: u64 = baseline_result
+        .baseline_reports
+        .iter()
+        .map(|tx| tx.used_cu as u64)
+        .sum();
+    let baseline_cu_avg = if baseline_result.tx_count > 0 {
+        Some(baseline_cu_total as f64 / baseline_result.tx_count as f64)
+    } else {
+        None
+    };
+    println!("ER total CU               : {}", er_result.er_cu_total);
+    println!("baseline total CU         : {}", baseline_cu_total);
+    println!(
+        "avg CU (ER | baseline)    : {} | {}",
+        er_cu_avg
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "-".to_string()),
+        baseline_cu_avg
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "-".to_string())
+    );
+
+    println!(
+        "latency p50/p95 (ms)      : ER {}/{} | baseline {}/{}",
+        fmt_opt_f64(er_result.er_latency_stats.p50_ms),
+        fmt_opt_f64(er_result.er_latency_stats.p95_ms),
+        fmt_opt_f64(baseline_result.latency_stats.p50_ms),
+        fmt_opt_f64(baseline_result.latency_stats.p95_ms)
+    );
+
+    println!(
+        "ER success/fallback rate  : {:.3} / {:.3}",
+        er_result.er_success_rate, er_result.er_fallback_rate
+    );
+    println!(
+        "plan fingerprint coverage : {:.2}%",
+        er_result.plan_fingerprint_coverage * 100.0
+    );
+
+    Ok(())
+}
+
+fn er_report_json(result: &ErRunResult, tracing: &TracingReport) -> serde_json::Value {
+    let er_avg_fee = if result.er_real_chunks > 0 {
+        Some(result.er_fee_total as f64 / result.er_real_chunks as f64)
+    } else {
+        None
+    };
+
+    json!({
+        "mode": "er-only",
+        "tracing": tracing,
+        "er": {
+            "intents": result.dag_node_count,
+            "dag_layers": result.dag_layer_sizes,
+            "chunks": {
+                "executed": result.er_real_chunks,
+                "simulated": result.er_simulated_chunks,
+            },
+            "fee_total_lamports": result.er_fee_total,
+            "fee_avg_lamports": er_avg_fee,
+            "latency": result.er_latency_stats,
+            "execution": result.er_exec_stats,
+            "plan_fingerprint_coverage": result.plan_fingerprint_coverage,
+            "success_rate": result.er_success_rate,
+            "fallback_rate": result.er_fallback_rate,
+            "router": result.router_health_summary.clone(),
+            "telemetry": result
+                .telemetry_summary
+                .as_ref()
+                .map(er_telemetry_json),
+            "blockhash_manager": blockhash_metrics_json(&result.blockhash_metrics),
+            "alt_metrics": alt_metrics_json(&result.alt_metrics),
+            "occ_metrics": occ_metrics_json(&result.occ_metrics),
+            "rpc_metrics": result.rpc_metrics.clone(),
+            "signatures": result.signatures.clone(),
+        }
+    })
+}
+
+fn baseline_report_json(
+    result: &BaselineRunResult,
+    tracing: &TracingReport,
+    rpc_metrics: &bundler::sender::RpcMetrics,
+) -> serde_json::Value {
+    json!({
+        "mode": "baseline-only",
+        "tracing": tracing,
+        "baseline": {
+            "intents": result.dag_node_count,
+            "dag_layers": result.dag_layer_sizes,
+            "tx_count": result.tx_count,
+            "fee_total_lamports": result.fee_total,
+            "fee_avg_lamports": result.fee_avg,
+            "latency": result.latency_stats,
+            "blockhash_stats": result.blockhash_stats,
+            "rpc_metrics": rpc_metrics,
+            "signatures": result.signatures.clone(),
+        }
+    })
+}
+
+fn compare_report_json(
+    er_result: &ErRunResult,
+    er_tracing: &TracingReport,
+    baseline_result: &BaselineRunResult,
+    baseline_tracing: &TracingReport,
+) -> serde_json::Value {
+    let baseline_rpc_delta = rpc_metrics_diff(&baseline_result.rpc_metrics, &er_result.rpc_metrics);
+    let er_avg_fee = if er_result.er_real_chunks > 0 {
+        Some(er_result.er_fee_total as f64 / er_result.er_real_chunks as f64)
+    } else {
+        None
+    };
+    let baseline_cu_total: u64 = baseline_result
+        .baseline_reports
+        .iter()
+        .map(|tx| tx.used_cu as u64)
+        .sum();
+    let comparison = {
+        let fee_delta = baseline_result.fee_total as i64 - er_result.er_fee_total as i64;
+        let fee_savings_pct = if baseline_result.fee_total > 0 {
+            (fee_delta as f64 / baseline_result.fee_total as f64) * 100.0
+        } else {
+            0.0
+        };
+        json!({
+            "fee_total_er": er_result.er_fee_total,
+            "fee_total_baseline": baseline_result.fee_total,
+            "fee_delta_lamports": fee_delta,
+            "fee_savings_pct": fee_savings_pct,
+            "cu_total_er": er_result.er_cu_total,
+            "cu_total_baseline": baseline_cu_total,
+            "latency_p50_ms_er": er_result.er_latency_stats.p50_ms,
+            "latency_p50_ms_baseline": baseline_result.latency_stats.p50_ms,
+            "latency_p95_ms_er": er_result.er_latency_stats.p95_ms,
+            "latency_p95_ms_baseline": baseline_result.latency_stats.p95_ms,
+            "success_rate_er": er_result.er_success_rate,
+            "fallback_rate_er": er_result.er_fallback_rate,
+            "plan_fingerprint_coverage": er_result.plan_fingerprint_coverage,
+        })
+    };
+
+    json!({
+        "mode": "compare",
+        "tracing": {
+            "er": er_tracing,
+            "baseline": baseline_tracing,
+        },
+        "er": {
+            "intents": er_result.dag_node_count,
+            "dag_layers": er_result.dag_layer_sizes,
+            "chunks": {
+                "executed": er_result.er_real_chunks,
+                "simulated": er_result.er_simulated_chunks,
+            },
+            "fee_total_lamports": er_result.er_fee_total,
+            "fee_avg_lamports": er_avg_fee,
+            "latency": er_result.er_latency_stats,
+            "execution": er_result.er_exec_stats,
+            "success_rate": er_result.er_success_rate,
+            "fallback_rate": er_result.er_fallback_rate,
+            "router": er_result.router_health_summary.clone(),
+            "telemetry": er_result
+                .telemetry_summary
+                .as_ref()
+                .map(er_telemetry_json),
+            "blockhash_manager": blockhash_metrics_json(&er_result.blockhash_metrics),
+            "alt_metrics": alt_metrics_json(&er_result.alt_metrics),
+            "occ_metrics": occ_metrics_json(&er_result.occ_metrics),
+            "rpc_metrics": er_result.rpc_metrics.clone(),
+            "signatures": er_result.signatures.clone(),
+        },
+        "baseline": {
+            "intents": baseline_result.dag_node_count,
+            "dag_layers": baseline_result.dag_layer_sizes,
+            "tx_count": baseline_result.tx_count,
+            "fee_total_lamports": baseline_result.fee_total,
+            "fee_avg_lamports": baseline_result.fee_avg,
+            "latency": baseline_result.latency_stats,
+            "blockhash_stats": baseline_result.blockhash_stats,
+            "rpc_metrics": baseline_rpc_delta,
+            "signatures": baseline_result.signatures.clone(),
+        },
+        "comparison": comparison,
+    })
+}
+
+fn write_json_report(path: &Path, value: serde_json::Value) -> Result<()> {
+    let json = serde_json::to_string_pretty(&value)?;
+    fs::write(path, json)?;
+    println!("wrote JSON report to {:?}", path);
+    Ok(())
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let args = Args::parse();
+
+    if args.mode != RunMode::Compare && args.compare_baseline {
+        tracing::warn!(
+            "--compare-baseline ignored when --mode is not compare; use --mode compare to run both paths"
+        );
+    }
+    if args.mode == RunMode::Compare && !args.compare_baseline {
+        tracing::warn!(
+            "--mode compare selected but --compare-baseline=false; baseline will still run in compare mode"
+        );
+    }
+
+    let mut setup = SharedSetup::build(&args).await?;
+
+    match args.mode {
+        RunMode::ErOnly => {
+            let (er_result, er_tracing) = run_er_once(&args, &mut setup).await?;
+            print_er_report(&args, &er_result, &er_tracing)?;
+            if let Some(path) = args.out_report.as_ref() {
+                let value = er_report_json(&er_result, &er_tracing);
+                write_json_report(path.as_path(), value)?;
+            }
+        }
+        RunMode::BaselineOnly => {
+            let baseline_ctx = setup.build_baseline_context();
+            let (baseline_result, baseline_tracing) =
+                run_baseline_once(&args, &setup, baseline_ctx).await?;
+            let rpc_metrics = baseline_result.rpc_metrics.clone();
+            print_baseline_report(
+                &baseline_result,
+                &baseline_tracing,
+                &rpc_metrics,
+                args.print_sigs,
+            )?;
+            if let Some(path) = args.out_report.as_ref() {
+                let value = baseline_report_json(&baseline_result, &baseline_tracing, &rpc_metrics);
+                write_json_report(path.as_path(), value)?;
+            }
+        }
+        RunMode::Compare => {
+            let (er_result, er_tracing) = run_er_once(&args, &mut setup).await?;
+            let baseline_ctx = setup.build_baseline_context();
+            let (baseline_result, baseline_tracing) =
+                run_baseline_once(&args, &setup, baseline_ctx).await?;
+            print_compare_reports(
+                &args,
+                &er_result,
+                &er_tracing,
+                &baseline_result,
+                &baseline_tracing,
+            )?;
+            if let Some(path) = args.out_report.as_ref() {
+                let value = compare_report_json(
+                    &er_result,
+                    &er_tracing,
+                    &baseline_result,
+                    &baseline_tracing,
+                );
+                write_json_report(path.as_path(), value)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_commitment(s: &str) -> CommitmentConfig {
@@ -1030,1523 +3078,6 @@ fn make_build_vmsg<'a>(
         };
         bundler::serializer::build_v0_message(&ctx, &chunk_intents)
     }
-}
-
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    let args = Args::parse();
-
-    let mut rpc_base_url = args.rpc.clone();
-    let payer = Arc::new(
-        read_keypair_file(&args.payer)
-            .map_err(|e| anyhow!("reading keypair {:?}: {e}", args.payer))?,
-    );
-    let payer_pubkey = payer.pubkey();
-
-    let commitment = parse_commitment(&args.commitment);
-
-    let wiretap = Wiretap::new(args.er_wiretap_dir.clone());
-    let mut er_bhfa_cfg: Option<BhfaConfig> = None;
-
-    // --------- Intents ----------
-    let intents: Vec<UserIntent> = if let Some(path) = args.intents.as_ref() {
-        let data = fs::read_to_string(path).context("reading intents file")?;
-        let parsed: Vec<UserIntent> =
-            serde_json::from_str(&data).context("parsing intents JSON")?;
-        parsed.into_iter().map(|ui| ui.normalized()).collect()
-    } else if args.demo_mixed {
-        let to_str = args
-            .demo_conflicting_to
-            .as_ref()
-            .ok_or_else(|| anyhow!("--demo-mixed also requires --demo-conflicting-to <PUBKEY>"))?;
-        let dest = Pubkey::from_str(to_str)
-            .map_err(|_| anyhow!("--demo-conflicting-to must be a valid pubkey"))?;
-
-        let mut v = Vec::new();
-        for i in 0..args.mixed_memos {
-            let ix = memo_ix(&format!("CPSR demo memo #{i}"));
-            v.push(UserIntent::new(payer_pubkey, ix, 9, None));
-        }
-        for i in 0..args.mixed_contended {
-            let ix = system_instruction::transfer(&payer_pubkey, &dest, args.demo_lamports);
-            let prio: u8 = match i % 3 {
-                0 => 7,
-                1 => 5,
-                _ => 3,
-            };
-            v.push(UserIntent::new(payer_pubkey, ix, prio, None));
-        }
-        v
-    } else if let Some(to_str) = &args.demo_conflicting_to {
-        let dest = Pubkey::from_str(to_str)
-            .map_err(|_| anyhow!("--demo-conflicting-to must be a valid pubkey"))?;
-        (0..args.demo_count)
-            .map(|_| {
-                let ix = system_instruction::transfer(&payer_pubkey, &dest, args.demo_lamports);
-                UserIntent::new(payer_pubkey, ix, 0, None)
-            })
-            .collect()
-    } else {
-        return Err(anyhow!(
-            "Provide either --intents PATH, --demo-mixed (with --demo-conflicting-to), or --demo-conflicting-to PUBKEY"
-        ));
-    };
-    if intents.is_empty() {
-        return Err(anyhow!("No intents to run"));
-    }
-
-    // --------- Static config ----------
-    let safety = SafetyMargins::default();
-    let mut tx_budget = TxBudget::default();
-    if args.er_merge_small_intents {
-        tx_budget.max_instructions = tx_budget.max_instructions.saturating_mul(2).min(60);
-        tx_budget.max_bytes = tx_budget.max_bytes.saturating_add(256);
-    }
-    let alt_policy = AltPolicy {
-        enabled: args.enable_alt,
-        ..AltPolicy::default()
-    };
-    let occ_cfg = OccConfig::default();
-
-    // --------- ER router (if enabled). IMPORTANT: sender still uses the real RPC.
-    let (er_ctx_opt, er_metrics): (Option<ErExecutionCtx>, Option<Arc<ErTelemetry>>) = if args
-        .er_enabled
-    {
-        let telemetry = Arc::new(ErTelemetry::default());
-        let router_str = args
-            .er_router
-            .clone()
-            .unwrap_or_else(|| "https://devnet-router.magicblock.app/".to_string());
-        let router_url = Url::parse(&router_str).context("invalid --er-router URL")?;
-        let endpoint_override = match args.er_endpoint.as_deref() {
-            Some(raw) => Some(Url::parse(raw).context("invalid --er-endpoint URL")?),
-            None => None,
-        };
-
-        let http_timeout = Duration::from_millis(args.er_http_timeout_ms.max(100));
-        let connect_timeout = Duration::from_millis(args.er_connect_timeout_ms.max(50));
-        let circuit_cooldown = Duration::from_millis(args.er_circuit_cooldown_ms.max(100));
-
-        // Diagnostic discovery (DO NOT override automatically)
-        if endpoint_override.is_none() {
-            match discover_er_endpoint(
-                &router_url,
-                args.er_router_key.clone(),
-                http_timeout,
-                connect_timeout,
-            )
-            .await
-            {
-                Ok(Some(url)) => {
-                    tracing::info!(
-                        target: "er",
-                        router = %router_url.as_str(),
-                        discovered_endpoint = %url.as_str(),
-                        "Router discovery succeeded via /getRoutes (diagnostic only; not overriding endpoint)"
-                    );
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        target: "er",
-                        router = %router_url.as_str(),
-                        "Router discovery returned no routes or error; proceeding with router only"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "er",
-                        router = %router_url.as_str(),
-                        "Router discovery failed ({e}); proceeding with router only"
-                    );
-                }
-            }
-        }
-
-        // Active probes to capture HTTP/JSON-RPC behavior and payloads
-        if let Err(e) = probe_er_router(
-            &router_url,
-            args.er_router_key.clone(),
-            http_timeout,
-            connect_timeout,
-            &wiretap,
-        )
-        .await
-        {
-            tracing::warn!(target: "er", router = %router_url, "router probe failed: {e}");
-        }
-
-        let api_key_state = match args.er_router_key.as_deref() {
-            Some(k) if k.is_empty() => {
-                tracing::warn!(
-                    target: "er.config",
-                    "router API key provided but empty; header will be omitted"
-                );
-                "empty"
-            }
-            Some(_) => "present",
-            None => "absent",
-        };
-
-        let cfg = ErClientConfig {
-            endpoint_override,
-            http_timeout,
-            connect_timeout,
-            // kept in struct; not used by preflight now
-            session_ttl: Duration::from_millis(args.er_session_ms.max(1_000)),
-            retries: args.er_retries,
-            privacy_mode: args.er_privacy.into(),
-            router_url,
-            router_api_key: args.er_router_key.clone(),
-            route_cache_ttl: Duration::from_millis(args.er_route_ttl_ms),
-            circuit_breaker_failures: args.er_circuit_failures,
-            circuit_breaker_cooldown: circuit_cooldown,
-            payer: payer.clone(),
-            blockhash_cache_ttl: Duration::from_millis(args.er_blockhash_ttl_ms),
-            min_cu_threshold: args.er_min_cu_threshold,
-            merge_small_intents: args.er_merge_small_intents,
-            telemetry: Some(telemetry.clone()),
-        };
-        er_bhfa_cfg = Some(BhfaConfig::new(
-            cfg.router_url.clone(),
-            cfg.router_api_key.clone(),
-            cfg.http_timeout,
-            cfg.connect_timeout,
-        ));
-
-        let privacy_label = er_privacy_cli_label(args.er_privacy);
-        tracing::info!(
-            target: "er.config",
-            router = cfg.router_url.as_str(),
-            privacy = privacy_label,
-            http_timeout_ms = cfg.http_timeout.as_millis(),
-            connect_timeout_ms = cfg.connect_timeout.as_millis(),
-            session_ttl_ms = cfg.session_ttl.as_millis(),
-            retries = cfg.retries,
-            circuit_breaker_failures = cfg.circuit_breaker_failures,
-            circuit_breaker_cooldown_ms = cfg.circuit_breaker_cooldown.as_millis(),
-            route_cache_ttl_ms = cfg.route_cache_ttl.as_millis(),
-            blockhash_cache_ttl_ms = cfg.blockhash_cache_ttl.as_millis(),
-            min_cu_threshold = cfg.min_cu_threshold,
-            merge_small_intents = args.er_merge_small_intents,
-            endpoint_override = cfg
-                .endpoint_override
-                .as_ref()
-                .map(|u| u.as_str())
-                .unwrap_or("<none>"),
-            api_key_state = api_key_state,
-            er_require = args.er_require,
-            "ER feature gate summary"
-        );
-
-        if let Some(ep) = cfg.endpoint_override.as_ref() {
-            tracing::info!(
-                target: "er.config",
-                endpoint_override = ep.as_str(),
-                "Router dispatch bypassed for data plane due to --er-endpoint"
-            );
-        }
-
-        // RECOMMENDED PREFLIGHT (no control-plane)
-        let preflight_result = match preflight_er_connectivity(
-            &cfg,
-            &cfg.router_url,
-            cfg.router_api_key.as_deref(),
-            payer_pubkey,
-            &wiretap,
-        )
-        .await
-        {
-            Ok(res) => Some(res),
-            Err(err) => {
-                tracing::warn!(
-                    target: "er.preflight",
-                    router = cfg.router_url.as_str(),
-                    "preflight connectivity probe failed: {:#}",
-                    err
-                );
-                None
-            }
-        };
-
-        if args.er_proxy_rpc {
-            match preflight_result
-                .as_ref()
-                .and_then(|res| res.discovered_route_base.clone())
-            {
-                Some(route) => {
-                    let effective = route; // rely on Url normalization from router
-                    tracing::info!(
-                        target: "er",
-                        effective = %effective,
-                        "ER proxy mode enabled: switching effective RPC base to Magic Router route"
-                    );
-                    rpc_base_url = effective;
-                }
-                None => {
-                    tracing::warn!(
-                        target: "er",
-                        "ER proxy mode requested but no route discovered; keeping original --rpc"
-                    );
-                }
-            }
-        }
-
-        let client = HttpErClient::new(cfg.clone())?;
-        let client: Arc<dyn ErClient> = Arc::new(client);
-
-        // IMPORTANT: enable ER execution (the previous code passed `true` here, which
-        // made the ctx discovery-only and forced a fallback every time).
-        let enabled = true;
-
-        (
-            Some(ErExecutionCtx::new(
-                client,
-                telemetry.clone(),
-                enabled,
-                args.dry_run,
-                cfg.min_cu_threshold,
-                cfg.merge_small_intents,
-            )),
-            Some(telemetry),
-        )
-    } else {
-        (None, None)
-    };
-
-    let rpc = Arc::new(RpcClient::new_with_timeout_and_commitment(
-        rpc_base_url.clone(),
-        Duration::from_secs(25),
-        commitment.clone(),
-    ));
-
-    // Mock check
-    let mock_in_use = rpc_base_url.contains("mock") || std::env::var("SOLANA_RPC_MOCK").is_ok();
-    tracing::info!(
-        rpc_url = %rpc_base_url,
-        mock_in_use = mock_in_use,
-        "RPC client initialized"
-    );
-
-    // --------- Deps ----------
-    let catalog = if let Some(list) = args.alt_tables.as_deref() {
-        let table_pks: Vec<Pubkey> = list
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| Pubkey::from_str(s))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| anyhow!("invalid --alt-tables list"))?;
-        if table_pks.is_empty() {
-            None
-        } else {
-            Some(Arc::new(TableCatalog::from_rpc(rpc.clone(), table_pks)?))
-        }
-    } else {
-        None
-    };
-
-    let mut alt_mgr_builder = CachingAltManager::new(
-        alt_policy.clone(),
-        Duration::from_millis(args.alt_cache_ttl_ms),
-    );
-    if let Some(cat) = &catalog {
-        alt_mgr_builder = alt_mgr_builder.with_catalog(cat.clone());
-    }
-    let alt_mgr: Arc<dyn AltManager> = if args.enable_alt {
-        Arc::new(alt_mgr_builder)
-    } else {
-        Arc::new(NoAltManager)
-    };
-
-    let account_fetcher = Arc::new(RpcAccountFetcher::new_with_drift(
-        rpc.clone(),
-        commitment.clone(),
-        occ_cfg.max_slot_drift,
-    ));
-
-    let max_age_ms = args.blockhash_max_age_ms.clamp(1_000, 120_000);
-    let refresh_every = args.blockhash_refresh_every_n.max(1);
-    let blockhash_policy = BlockhashPolicy {
-        max_age: Duration::from_millis(max_age_ms as u64),
-        refresh_every,
-    };
-    let blockhash_manager = Arc::new(BlockhashManager::new(
-        rpc.clone(),
-        commitment.clone(),
-        blockhash_policy.clone(),
-        !args.fast_send,
-    ));
-    let blockhash_provider: Arc<dyn BlockhashProvider> = if let Some(cfg) = er_bhfa_cfg.clone() {
-        Arc::new(ErAwareBlockhashProvider::new(
-            blockhash_manager.clone(),
-            cfg,
-            payer_pubkey,
-        ))
-    } else {
-        blockhash_manager.clone()
-    };
-    tracing::info!(
-        target: "blockhash",
-        max_age_ms = max_age_ms,
-        refresh_every = refresh_every,
-        pre_check = !args.fast_send,
-        "Blockhash policy configured"
-    );
-
-    // Choose fee oracle
-    let fee_oracle: Box<dyn FeeOracle> = match args.fee_oracle {
-        FeeOracleCli::Basic => Box::new(bundler::fee::BasicFeeOracle {
-            max_cu_limit: args.max_cu_limit.unwrap_or(1_400_000),
-            min_cu_price: args.min_cu_price.or(args.cu_price).unwrap_or(100),
-            max_cu_price: args.max_cu_price.unwrap_or(5_000),
-        }),
-        FeeOracleCli::Recent => {
-            use bundler::fee_oracles::recent::RecentFeesOracle;
-
-            let probes: Vec<Pubkey> = args
-                .probe_accounts
-                .as_deref()
-                .unwrap_or("")
-                .split(',')
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| Pubkey::from_str(s.trim()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| anyhow!("invalid --probe-accounts list"))?;
-
-            let mut o = RecentFeesOracle::new(rpc.clone(), probes);
-            if let Some(v) = args.max_cu_limit {
-                o.max_cu_limit = v;
-            }
-            if let Some(v) = args.min_cu_price.or(args.cu_price) {
-                o.min_cu_price = v;
-            }
-            if let Some(v) = args.max_cu_price {
-                o.max_cu_price = v;
-            }
-            if let Some(v) = args.fee_pctile {
-                o.p_primary = v;
-            }
-            if let Some(v) = args.fee_alpha {
-                o.ema_alpha = v;
-            }
-            if let Some(v) = args.fee_hysteresis_bps {
-                o.hysteresis_bps = v;
-            }
-            Box::new(o)
-        }
-    };
-    // Build sender against the actual Solana RPC (never the router URL)
-    let sender = {
-        let mut s = ReliableSender::with_scope(rpc.clone(), fee_oracle, args.cu_scope.into());
-        if args.fast_send {
-            s = s.with_fast_send();
-        }
-        Arc::new(s)
-    };
-
-    let concurrency = args.concurrency.clamp(1, 12);
-    let parallel_cfg_template = ParallelLayerConfig {
-        max_concurrency: concurrency,
-        max_attempts: 3,
-        base_backoff: Duration::from_millis(200),
-        max_backoff: Duration::from_millis(1_500),
-        dry_run: args.dry_run,
-    };
-    let parallel_deps = ParallelLayerDeps {
-        sender: sender.clone(),
-        payer: payer.clone(),
-        safety: safety.clone(),
-        alt_manager: alt_mgr.clone(),
-        occ_fetcher: account_fetcher.clone(),
-        occ_config: occ_cfg.clone(),
-        blockhash_provider: blockhash_provider.clone(),
-        er: er_ctx_opt,
-    };
-
-    // --------- DAG & layers ----------
-    let dag_start = Instant::now();
-    let dag = {
-        let span = tracing::info_span!("dag.build", intents_total = intents.len());
-        let _enter = span.enter();
-        tracing::info!("Building DAG from {} intents", intents.len());
-        Dag::build(intents.clone())
-    };
-    let dag_duration = dag_start.elapsed();
-    tracing::info!("DAG build completed in {:?}", dag_duration);
-
-    let layers = dag.layers().context("topo layers")?;
-    let layers_sizes: Vec<usize> = layers.iter().map(|l| l.len()).collect();
-    tracing::info!("DAG has {} layers: {:?}", layers.len(), layers_sizes);
-
-    let mut rollup_reports: Vec<TxCost> = Vec::new();
-    let mut layer_summaries: Vec<LayerSummary> = Vec::new();
-    let mut er_total_latency = Duration::ZERO;
-    let mut er_latency_samples: Vec<Duration> = Vec::new();
-    let mut er_exec_samples: Vec<Duration> = Vec::new();
-    let mut er_cu_total: u64 = 0;
-    let mut er_fee_total: u64 = 0;
-    let mut er_chunks_total = 0usize;
-    let mut er_plan_fingerprint_real = 0usize;
-    let mut er_chunk_rows: Vec<ErChunkSummaryRow> = Vec::new();
-    let mut er_real_chunks = 0usize;
-    let mut er_simulated_chunks = 0usize;
-
-    // --------- ROLLUP path ----------
-    tracing::info!("Starting rollup processing with {} layers", layers.len());
-    for (layer_index, layer) in layers.iter().enumerate() {
-        let layer_span = tracing::info_span!(
-            "chunking.layer",
-            layer_index = layer_index,
-            layer_size = layer.len()
-        );
-        let _guard = layer_span.enter();
-
-        tracing::info!(
-            "Processing layer {} with {} intents",
-            layer_index,
-            layer.len()
-        );
-        sender.start_scope();
-
-        let chunking_start = Instant::now();
-        let planned_chunks =
-            chunk_layer_with(layer, &dag.nodes, &tx_budget, &alt_policy, &ChunkOracle)?;
-        let chunking_duration = chunking_start.elapsed();
-        tracing::info!(
-            "Chunking layer {} took {:?}, produced {} chunks",
-            layer_index,
-            chunking_duration,
-            planned_chunks.len()
-        );
-
-        let mut chunk_plans = Vec::with_capacity(planned_chunks.len());
-        for (chunk_idx, planned) in planned_chunks.iter().enumerate() {
-            let chunk_intents: Vec<UserIntent> = planned
-                .node_ids
-                .iter()
-                .map(|&nid| dag.nodes[nid as usize].clone())
-                .collect();
-            tracing::info!(
-                target: "planner",
-                chunk_index = chunk_idx,
-                node_count = planned.node_ids.len(),
-                est_cu = planned.est_cu,
-                est_msg_bytes = planned.est_message_bytes,
-                alt_ro = planned.alt_readonly,
-                alt_wr = planned.alt_writable,
-                "planned chunk"
-            );
-            chunk_plans.push(ChunkPlan {
-                index: chunk_idx,
-                intents: chunk_intents,
-                estimates: ChunkEstimates {
-                    est_cu: planned.est_cu,
-                    est_msg_bytes: planned.est_message_bytes,
-                    alt_ro_count: planned.alt_readonly,
-                    alt_wr_count: planned.alt_writable,
-                },
-                merged_indices: Vec::new(),
-            });
-        }
-
-        let mut cfg = parallel_cfg_template.clone();
-        if chunk_plans.len() <= 1 {
-            cfg.max_concurrency = 1;
-        }
-        let use_parallel = cfg.max_concurrency > 1 && chunk_plans.len() > 1;
-
-        let LayerResult {
-            layer_index: _,
-            wall_clock,
-            chunks,
-        } = send_layer_parallel(layer_index, chunk_plans, parallel_deps.clone(), cfg).await;
-
-        let mut layer_success = 0usize;
-        let mut layer_failure = 0usize;
-        let mut simulate_durations: Vec<Duration> = Vec::new();
-        let mut send_durations: Vec<Duration> = Vec::new();
-
-        for chunk in chunks {
-            let chunk_er_diag = chunk.er.clone();
-            let chunk_index = chunk.index;
-            let chunk_attempts = chunk.attempts;
-            let chunk_timings = chunk.timings;
-            let chunk_estimates = chunk.estimates.clone();
-
-            match chunk.outcome {
-                bundler::pipeline::rollup::ChunkOutcome::Success(success) => {
-                    layer_success += 1;
-                    simulate_durations.push(success.report.simulate_duration);
-                    if let Some(send_dur) = success.report.send_duration {
-                        send_durations.push(send_dur);
-                    }
-
-                    let mut fallback_reason = chunk_er_diag.fallback_reason.clone();
-                    if !chunk_er_diag.session_established {
-                        if fallback_reason.is_none() {
-                            let inferred = if !chunk_er_diag.er_ctx_present {
-                                "context_absent"
-                            } else if !chunk_er_diag.er_enabled {
-                                "er_disabled_by_config"
-                            } else if !chunk_er_diag.attempted {
-                                "er_not_attempted"
-                            } else {
-                                "unspecified (inspect logs)"
-                            };
-                            fallback_reason = Some(inferred.to_string());
-                        }
-                    }
-
-                    // Interpret decision for summary
-                    let decision = if chunk_er_diag.session_established {
-                        "ran_er"
-                    } else if chunk_er_diag.simulated {
-                        "simulated_er"
-                    } else {
-                        "fell_back"
-                    };
-
-                    // If we have telemetry, echo last router json-rpc error for context
-                    if let Some(ref tm) = er_metrics {
-                        let sum = tm.summary();
-                        if let Some(code) = sum.last_router_error_code {
-                            let meaning = json_rpc_code_meaning(code);
-                            tracing::info!(
-                                target: "er.context",
-                                layer_index,
-                                chunk_index,
-                                last_router_error_code = code,
-                                last_router_error_meaning = %meaning,
-                                last_router_error_message = %sum
-                                    .last_router_error_message
-                                    .as_deref()
-                                    .unwrap_or("-"),
-                                "router last JSON-RPC error snapshot"
-                            );
-                        }
-                    }
-
-                    if success.plan_fingerprint.is_some() && chunk_er_diag.session_established {
-                        er_plan_fingerprint_real += 1;
-                    }
-
-                    if chunk_er_diag.session_established {
-                        er_real_chunks += 1;
-                        er_chunks_total += 1;
-                        er_cu_total += success.report.used_cu as u64;
-                        er_fee_total += success.report.total_fee_lamports;
-                        er_total_latency += chunk_timings.total;
-                        er_latency_samples.push(chunk_timings.total);
-                        if let Some(exec_dur) = success.er_execution_duration {
-                            er_exec_samples.push(exec_dur);
-                        }
-                    } else if chunk_er_diag.simulated {
-                        er_simulated_chunks += 1;
-                    }
-
-                    let sig_section = signatures_section_len(success.report.required_signers);
-                    let packet_bytes = success.report.message_bytes + sig_section;
-                    let max_msg_budget =
-                        safety.max_message_bytes_with_signers(success.report.required_signers);
-                    let max_packet_bytes = max_msg_budget + sig_section;
-                    let guard_pass = success.report.message_bytes <= max_msg_budget;
-                    let er_execution_ms_opt = success.er_execution_duration.map(|d| d.as_millis());
-
-                    tracing::info!(
-                        target: "er.decide",
-                        layer_index,
-                        chunk_index = chunk_index,
-                        er_enabled = args.er_enabled,
-                        er_ctx_present = chunk_er_diag.er_ctx_present,
-                        er_attempted = chunk_er_diag.attempted,
-                        er_simulated = chunk_er_diag.simulated,
-                        er_execution_duration_ms = er_execution_ms_opt,
-                        plan_fingerprint_present = success.plan_fingerprint.is_some(),
-                        used_cu = success.report.used_cu,
-                        final_cu_limit = success.report.final_plan.cu_limit,
-                        final_cu_price = success.report.final_plan.cu_price_microlamports,
-                        message_bytes = success.report.message_bytes,
-                        alt_keys_offloaded = success.alt_resolution.stats.keys_offloaded,
-                        guard_pass,
-                        decision = decision,
-                        fallback_reason = fallback_reason.as_deref(),
-                        route_endpoint = chunk_er_diag.route_endpoint.as_deref(),
-                        "ER per-chunk decision"
-                    );
-
-                    er_chunk_rows.push(ErChunkSummaryRow {
-                        layer: layer_index,
-                        chunk: chunk_index,
-                        decision: decision.to_string(),
-                        reason: fallback_reason.clone(),
-                        route: chunk_er_diag.route_endpoint.clone(),
-                        total_ms: chunk_timings.total.as_millis(),
-                        exec_ms: er_execution_ms_opt,
-                        used_cu: success.report.used_cu,
-                        er_attempted: chunk_er_diag.attempted,
-                        session_established: chunk_er_diag.session_established,
-                    });
-
-                    tracing::info!(
-                        target: "pipeline",
-                        layer_index,
-                        chunk_index = chunk_index,
-                        attempts = chunk_attempts,
-                        total_ms = chunk_timings.total.as_millis(),
-                        simulate_ms = success.report.simulate_duration.as_millis(),
-                        send_ms = success.report.send_duration.map(|d| d.as_millis()).unwrap_or(0),
-                        est_cu = chunk_estimates.est_cu,
-                        est_msg_bytes = chunk_estimates.est_msg_bytes,
-                        alt_keys = success.alt_resolution.stats.keys_offloaded,
-                        alt_saved_bytes = success.alt_resolution.stats.estimated_saved_bytes,
-                        last_valid_block_height = success.lease.last_valid_block_height,
-                        "chunk completed"
-                    );
-
-                    if let Some(sig) = &success.report.signature {
-                        tracing::info!(
-                            target: "pipeline",
-                            layer_index,
-                            chunk_index = chunk_index,
-                            sig = %sig,
-                            "transaction sent"
-                        );
-                    }
-
-                    rollup_reports.push(TxCost {
-                        signature: success.report.signature.map(|s| s.to_string()),
-                        used_cu: success.report.used_cu,
-                        cu_limit: success.report.final_plan.cu_limit,
-                        cu_price_micro_lamports: success.report.final_plan.cu_price_microlamports,
-                        message_bytes: success.report.message_bytes,
-                        required_signers: success.report.required_signers,
-                        packet_bytes,
-                        max_packet_bytes,
-                        packet_guard_pass: guard_pass,
-                        base_fee_lamports: success.report.base_fee_lamports,
-                        priority_fee_lamports: success.report.priority_fee_lamports,
-                        total_fee_lamports: success.report.total_fee_lamports,
-                    });
-                }
-                bundler::pipeline::rollup::ChunkOutcome::Failed {
-                    error,
-                    retriable,
-                    stage,
-                } => {
-                    layer_failure += 1;
-                    tracing::error!(
-                        target: "pipeline",
-                        layer_index,
-                        chunk_index = chunk_index,
-                        attempts = chunk_attempts,
-                        retriable,
-                        ?stage,
-                        est_cu = chunk_estimates.est_cu,
-                        est_msg_bytes = chunk_estimates.est_msg_bytes,
-                        est_alt_ro = chunk_estimates.alt_ro_count,
-                        est_alt_wr = chunk_estimates.alt_wr_count,
-                        "chunk failed: {error:?}"
-                    );
-                }
-            }
-        }
-
-        let p95_sim = percentile_duration(&mut simulate_durations, 0.95);
-        let p95_send = percentile_duration(&mut send_durations, 0.95);
-
-        tracing::info!(
-            target: "pipeline",
-            layer_index,
-            use_parallel,
-            chunks_total = layer_success + layer_failure,
-            chunks_success = layer_success,
-            chunks_failed = layer_failure,
-            wall_clock_ms = wall_clock.as_millis(),
-            p95_sim_ms = p95_sim.map(|d| d.as_millis()).unwrap_or(0),
-            p95_send_ms = p95_send.map(|d| d.as_millis()).unwrap_or(0),
-            "layer execution complete"
-        );
-
-        layer_summaries.push(LayerSummary {
-            index: layer_index,
-            chunks: layer_success + layer_failure,
-            success: layer_success,
-            failure: layer_failure,
-            wall_clock,
-        });
-
-        blockhash_manager.mark_layer_boundary();
-
-        // NOTE: previously --er-require enforced control-plane session;
-        // now we don't hard-abort here, since data-plane is the recommended path.
-    }
-
-    let er_summary = er_metrics.as_ref().map(|metrics| metrics.summary());
-    if let Some(summary) = &er_summary {
-        let total_routes = summary.routes_ok + summary.routes_err;
-        let discovery_success_rate = if total_routes > 0 {
-            summary.routes_ok as f64 / total_routes as f64
-        } else {
-            0.0
-        };
-        let total_cache_lookups = summary.router_cache_hits + summary.router_cache_misses;
-        let cache_hit_rate = if total_cache_lookups > 0 {
-            summary.router_cache_hits as f64 / total_cache_lookups as f64
-        } else {
-            0.0
-        };
-        let total_blockhash_cache = summary.blockhash_cache_hits + summary.blockhash_cache_misses;
-        let blockhash_cache_hit_rate = if total_blockhash_cache > 0 {
-            summary.blockhash_cache_hits as f64 / total_blockhash_cache as f64
-        } else {
-            0.0
-        };
-
-        tracing::info!(
-            target: "er",
-            er_sessions = summary.sessions,
-            er_successes = summary.successes,
-            fallback_count = summary.fallbacks,
-            fallback_rate = if summary.sessions > 0 {
-                summary.fallbacks as f64 / summary.sessions as f64
-            } else {
-                0.0
-            },
-            routes_ok = summary.routes_ok,
-            routes_err = summary.routes_err,
-            discovery_success_rate,
-            cache_hit_rate,
-            cache_hits = summary.router_cache_hits,
-            cache_misses = summary.router_cache_misses,
-            blockhash_cache_hit_rate,
-            blockhash_cache_hits = summary.blockhash_cache_hits,
-            blockhash_cache_misses = summary.blockhash_cache_misses,
-            bhfa_ok = summary.bhfa_ok,
-            bhfa_err = summary.bhfa_err,
-            route_ms_p50 = summary.route_ms_p50.unwrap_or(0.0),
-            route_ms_p95 = summary.route_ms_p95.unwrap_or(0.0),
-            bhfa_ms_p50 = summary.bhfa_ms_p50.unwrap_or(0.0),
-            bhfa_ms_p95 = summary.bhfa_ms_p95.unwrap_or(0.0),
-            er_success_rate = summary.success_rate,
-            router_simulate = summary.router_simulate,
-            router_send = summary.router_send,
-            skipped_small_chunks = summary.small_chunk_skips,
-            merged_small_chunks = summary.merged_small_chunks,
-            er_real_chunks,
-            er_simulated_chunks,
-            "ER aggregate metrics"
-        );
-    }
-
-    // --------- BASELINE path ----------
-    let mut baseline: Vec<TxCost> = Vec::new();
-    let mut baseline_latency_samples: Vec<Duration> = Vec::new();
-    let mut baseline_total_latency = Duration::ZERO;
-    if args.compare_baseline {
-        tracing::info!("Starting baseline processing for {} intents", intents.len());
-        let baseline_start = Instant::now();
-
-        for (i, ui) in intents.iter().cloned().enumerate() {
-            let mut bh: Hash;
-            if let Some(cfg) = er_bhfa_cfg.as_ref() {
-                let accounts = collect_writables_or_payer(std::slice::from_ref(&ui), payer_pubkey);
-                let account_count = accounts.len();
-                match get_blockhash_for_accounts(cfg, &accounts).await {
-                    Ok((er_bh, _lvh)) => {
-                        bh = er_bh;
-                        tracing::info!(
-                            target: "blockhash",
-                            source = "BHFA",
-                            accounts = account_count,
-                            "using ER-aware blockhash"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "blockhash",
-                            "BHFA failed, falling back to L1 blockhash: {:#}",
-                            e
-                        );
-                        track_get_latest_blockhash();
-                        bh = rpc.get_latest_blockhash()?;
-                    }
-                }
-            } else {
-                track_get_latest_blockhash();
-                bh = rpc.get_latest_blockhash()?;
-            }
-            // ...
-
-            let mut build = make_build_vmsg(
-                payer_pubkey,
-                &mut bh,
-                AltResolution::default(),
-                vec![ui.clone()],
-                safety.clone(),
-                rpc.clone(),
-                commitment.clone(),
-            );
-            let rep = sender.simulate_build_and_send_with_report(
-                &mut build,
-                &[payer.as_ref()],
-                args.dry_run,
-            )?;
-
-            let sig_section = signatures_section_len(rep.required_signers);
-            let packet_bytes = rep.message_bytes + sig_section;
-            let max_msg_budget = safety.max_message_bytes_with_signers(rep.required_signers);
-            let max_packet_bytes = max_msg_budget + sig_section;
-            let guard_pass = rep.message_bytes <= max_msg_budget;
-
-            let tx_latency = rep.simulate_duration + rep.send_duration.unwrap_or_default();
-
-            baseline.push(TxCost {
-                signature: rep.signature.map(|s| s.to_string()),
-                used_cu: rep.used_cu,
-                cu_limit: rep.final_plan.cu_limit,
-                cu_price_micro_lamports: rep.final_plan.cu_price_microlamports,
-                message_bytes: rep.message_bytes,
-                required_signers: rep.required_signers,
-                packet_bytes,
-                max_packet_bytes,
-                packet_guard_pass: guard_pass,
-                base_fee_lamports: rep.base_fee_lamports,
-                priority_fee_lamports: rep.priority_fee_lamports,
-                total_fee_lamports: rep.total_fee_lamports,
-            });
-            baseline_total_latency += tx_latency;
-            baseline_latency_samples.push(tx_latency);
-            if (i + 1) % 10 == 0 || i == intents.len() - 1 {
-                tracing::info!("Baseline progress: {}/{}", i + 1, intents.len());
-            }
-        }
-
-        let baseline_duration = baseline_start.elapsed();
-        tracing::info!("Baseline processing completed in {:?}", baseline_duration);
-    }
-
-    let rollup_total: u64 = rollup_reports.iter().map(|x| x.total_fee_lamports).sum();
-    let baseline_total: u64 = baseline.iter().map(|x| x.total_fee_lamports).sum();
-    let savings_abs = baseline_total as i64 - rollup_total as i64;
-    let savings_pct = if baseline_total > 0 {
-        (savings_abs as f64) / (baseline_total as f64)
-    } else {
-        0.0
-    };
-
-    let baseline_cu_total: u64 = baseline.iter().map(|x| x.used_cu as u64).sum();
-    let er_avg_cu = if er_chunks_total > 0 {
-        er_cu_total as f64 / er_chunks_total as f64
-    } else {
-        0.0
-    };
-    let baseline_avg_cu = if !baseline.is_empty() {
-        baseline_cu_total as f64 / baseline.len() as f64
-    } else {
-        0.0
-    };
-    let er_avg_fee = if er_chunks_total > 0 {
-        er_fee_total as f64 / er_chunks_total as f64
-    } else {
-        0.0
-    };
-    let baseline_avg_fee = if !baseline.is_empty() {
-        baseline_total as f64 / baseline.len() as f64
-    } else {
-        0.0
-    };
-
-    let cu_savings_ratio = if baseline_cu_total > 0 {
-        (baseline_cu_total as f64 - er_cu_total as f64) / baseline_cu_total as f64
-    } else {
-        0.0
-    };
-    let fee_savings_ratio = if baseline_total > 0 {
-        (baseline_total as f64 - rollup_total as f64) / baseline_total as f64
-    } else {
-        0.0
-    };
-
-    let mut er_latency_for_pct = er_latency_samples.clone();
-    let er_latency_p50 = percentile_duration(&mut er_latency_for_pct, 0.50);
-    let er_latency_p95 = percentile_duration(&mut er_latency_for_pct, 0.95);
-    let (er_latency_variance, er_latency_stddev) = duration_variance_stddev(&er_latency_samples);
-
-    let mut baseline_latency_for_pct = baseline_latency_samples.clone();
-    let baseline_latency_p50 = percentile_duration(&mut baseline_latency_for_pct, 0.50);
-    let baseline_latency_p95 = percentile_duration(&mut baseline_latency_for_pct, 0.95);
-    let (baseline_latency_variance, baseline_latency_stddev) =
-        duration_variance_stddev(&baseline_latency_samples);
-
-    let mut er_exec_for_pct = er_exec_samples.clone();
-    let er_exec_p50 = percentile_duration(&mut er_exec_for_pct, 0.50);
-    let er_exec_p95 = percentile_duration(&mut er_exec_for_pct, 0.95);
-    let (er_exec_variance, er_exec_stddev) = duration_variance_stddev(&er_exec_samples);
-
-    let plan_fp_coverage = if er_chunks_total > 0 {
-        er_plan_fingerprint_real as f64 / er_chunks_total as f64
-    } else {
-        0.0
-    };
-
-    let er_latency_p50_ms = duration_to_ms(er_latency_p50);
-    let er_latency_p95_ms = duration_to_ms(er_latency_p95);
-    let baseline_latency_p50_ms = duration_to_ms(baseline_latency_p50);
-    let baseline_latency_p95_ms = duration_to_ms(baseline_latency_p95);
-    let er_exec_p50_ms = duration_to_ms(er_exec_p50);
-    let er_exec_p95_ms = duration_to_ms(er_exec_p95);
-
-    let rollup_latency_ms = er_total_latency.as_millis();
-    let baseline_latency_ms = baseline_total_latency.as_millis();
-    let latency_delta_ms = baseline_latency_ms as i128 - rollup_latency_ms as i128;
-    tracing::info!(
-        target: "metrics",
-        comparison = "ER vs Baseline",
-        fee_rollup = rollup_total,
-        fee_baseline = baseline_total,
-        fee_delta = savings_abs,
-        latency_rollup_ms = rollup_latency_ms,
-        latency_baseline_ms = baseline_latency_ms,
-        latency_delta_ms,
-        er_active = er_real_chunks > 0,
-        er_simulated_chunks,
-        "ER fee/latency comparison"
-    );
-
-    let (er_success_rate, er_fallback_rate, router_health_summary) = if let Some(summary) =
-        &er_summary
-    {
-        let fallback_rate = if summary.sessions > 0 {
-            summary.fallbacks as f64 / summary.sessions as f64
-        } else {
-            0.0
-        };
-        let discovery_total = summary.routes_ok + summary.routes_err;
-        let discovery_success_rate = if discovery_total > 0 {
-            summary.routes_ok as f64 / discovery_total as f64
-        } else {
-            0.0
-        };
-        let cache_total = summary.router_cache_hits + summary.router_cache_misses;
-        let cache_hit_rate = if cache_total > 0 {
-            summary.router_cache_hits as f64 / cache_total as f64
-        } else {
-            0.0
-        };
-        let blockhash_cache_total = summary.blockhash_cache_hits + summary.blockhash_cache_misses;
-        let blockhash_cache_hit_rate = if blockhash_cache_total > 0 {
-            summary.blockhash_cache_hits as f64 / blockhash_cache_total as f64
-        } else {
-            0.0
-        };
-        let router_summary = RouterHealthSummary {
-            discovery_success_rate,
-            discovery_p50_ms: summary.route_ms_p50,
-            discovery_p95_ms: summary.route_ms_p95,
-            cache_hit_rate,
-            cache_hits: summary.router_cache_hits,
-            cache_misses: summary.router_cache_misses,
-            blockhash_cache_hit_rate,
-            blockhash_cache_hits: summary.blockhash_cache_hits,
-            blockhash_cache_misses: summary.blockhash_cache_misses,
-            error_counts: summary.router_error_kinds.clone(),
-            blockhash_p50_ms: summary.bhfa_ms_p50,
-            blockhash_p95_ms: summary.bhfa_ms_p95,
-        };
-        (summary.success_rate, fallback_rate, Some(router_summary))
-    } else {
-        (0.0, 0.0, None)
-    };
-
-    if er_real_chunks > 0 {
-        println!("\n=== ER Performance ===");
-        println!(
-            "settlements               : {} (real) / {} (simulated)",
-            er_chunks_total, er_simulated_chunks
-        );
-        println!(
-            "cu total / avg (ER)       : {} / {:.2}",
-            er_cu_total, er_avg_cu
-        );
-        println!(
-            "cu total / avg (baseline) : {} / {:.2}",
-            baseline_cu_total, baseline_avg_cu
-        );
-        println!(
-            "cu savings ratio (info)   : {:.2}%",
-            cu_savings_ratio * 100.0
-        );
-        println!(
-            "fee total / avg (ER)      : {} / {:.2}",
-            er_fee_total, er_avg_fee
-        );
-        println!(
-            "fee total / avg (baseline): {} / {:.2}",
-            baseline_total, baseline_avg_fee
-        );
-        println!(
-            "fee savings ratio         : {:.2}%",
-            fee_savings_ratio * 100.0
-        );
-        println!(
-            "latency p50/p95 ms (ER | baseline): {}/{} | {}/{}",
-            fmt_opt_f64(er_latency_p50_ms),
-            fmt_opt_f64(er_latency_p95_ms),
-            fmt_opt_f64(baseline_latency_p50_ms),
-            fmt_opt_f64(baseline_latency_p95_ms)
-        );
-        println!(
-            "latency stddev/variance ms: {}/{}",
-            fmt_opt_f64(er_latency_stddev),
-            fmt_opt_f64(er_latency_variance)
-        );
-        println!(
-            "baseline stddev/variance ms: {}/{}",
-            fmt_opt_f64(baseline_latency_stddev),
-            fmt_opt_f64(baseline_latency_variance)
-        );
-        println!(
-            "ER execute p50/p95 ms     : {}/{}",
-            fmt_opt_f64(er_exec_p50_ms),
-            fmt_opt_f64(er_exec_p95_ms)
-        );
-        println!(
-            "ER execute stddev/variance: {}/{}",
-            fmt_opt_f64(er_exec_stddev),
-            fmt_opt_f64(er_exec_variance)
-        );
-        println!(
-            "plan fingerprint coverage : {:.2}%",
-            plan_fp_coverage * 100.0
-        );
-        println!(
-            "ER success rate / fallback rate : {:.3} / {:.3}",
-            er_success_rate, er_fallback_rate
-        );
-        if let Some(summary) = &er_summary {
-            println!("router total sessions      : {}", summary.sessions);
-            println!("router simulate count      : {}", summary.router_simulate);
-            println!("router send count          : {}", summary.router_send);
-            println!("skipped small chunks       : {}", summary.small_chunk_skips);
-            println!(
-                "merged small chunks        : {}",
-                summary.merged_small_chunks
-            );
-        }
-        if let Some(router) = &router_health_summary {
-            println!(
-                "router discovery success  : {:.2}%",
-                router.discovery_success_rate * 100.0
-            );
-            println!(
-                "route cache hit rate       : {:.2}% ({} hits / {} misses)",
-                router.cache_hit_rate * 100.0,
-                router.cache_hits,
-                router.cache_misses
-            );
-            println!(
-                "blockhash cache hit rate   : {:.2}% ({} hits / {} misses)",
-                router.blockhash_cache_hit_rate * 100.0,
-                router.blockhash_cache_hits,
-                router.blockhash_cache_misses
-            );
-        }
-    }
-
-    if let Some(summary) = &er_summary {
-        println!(
-            "session begin attempts/ok/err: {} / {} / {}",
-            summary.session_begin_attempts, summary.session_begin_ok, summary.session_begin_err
-        );
-        if let Some(code) = summary.last_router_error_code {
-            let meaning = json_rpc_code_meaning(code);
-            let message = summary.last_router_error_message.as_deref().unwrap_or("-");
-            println!(
-                "last router json-rpc error      : code {} ({}) message \"{}\"",
-                code, meaning, message
-            );
-        } else if let Some(message) = summary.last_router_error_message.as_deref() {
-            println!("last router error               : {}", message);
-        }
-        if args.er_enabled
-            && summary.session_begin_ok == 0
-            && summary.session_begin_attempts > 0
-            && summary.routes_ok > 0
-        {
-            println!(
-                "ER inactive: router reachable; settlements may still proceed if node data-plane is healthy."
-            );
-        }
-    }
-
-    if args.er_enabled && er_real_chunks == 0 {
-        let mut reason_set: BTreeSet<String> = BTreeSet::new();
-        for row in &er_chunk_rows {
-            if row.session_established {
-                continue;
-            }
-            if let Some(reason) = row.reason.as_deref() {
-                reason_set.insert(reason.to_string());
-            } else if row.er_attempted {
-                reason_set.insert("unspecified (inspect logs)".to_string());
-            }
-        }
-        let reason_summary = if reason_set.is_empty() {
-            None
-        } else {
-            Some(reason_set.into_iter().collect::<Vec<_>>().join(" | "))
-        };
-
-        if er_simulated_chunks > 0 {
-            if let Some(summary) = reason_summary.as_ref() {
-                println!(
-                    "note: ER path simulated only; no ER settlements executed. reasons: {}",
-                    summary
-                );
-            } else {
-                println!("note: ER path simulated only; no ER settlements executed.");
-            }
-        } else if let Some(summary) = reason_summary {
-            println!("note: ER inactive; {}", summary);
-        } else {
-            println!("note: ER path unavailable; fell back to direct-to-L1 for all chunks.");
-        }
-    }
-
-    if !er_chunk_rows.is_empty() {
-        println!("\n=== ER CHUNK SUMMARY ===");
-        println!(
-            "{:<5} {:<6} {:<16} {:<28} {:<40} {:>12} {:>16}",
-            "Layer", "Chunk", "Decision", "Reason", "Route", "Total (ms)", "ER execute (ms)"
-        );
-        for row in &er_chunk_rows {
-            let decision = truncate_cell(&row.decision, 16);
-            let reason = truncate_cell(row.reason.as_deref().unwrap_or("-"), 28);
-            let route = truncate_cell(row.route.as_deref().unwrap_or("-"), 40);
-            let exec_cell = row
-                .exec_ms
-                .map(|ms| ms.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "{:<5} {:<6} {:<16} {:<28} {:<40} {:>12} {:>16}",
-                row.layer, row.chunk, decision, reason, route, row.total_ms, exec_cell
-            );
-        }
-    }
-
-    let mut self_check_failures: Vec<String> = Vec::new();
-    if args.er_enabled && er_real_chunks > 0 && !args.dry_run {
-        tracing::info!(
-            target: "demo.self_check",
-            mode = "fee",
-            fee_threshold_pct = SELF_CHECK_FEE_THRESHOLD * 100.0,
-            exec_p95_threshold_ms = SELF_CHECK_EXEC_P95_THRESHOLD_MS,
-            fee_savings_ratio_pct = fee_savings_ratio * 100.0,
-            cu_savings_ratio_pct = cu_savings_ratio * 100.0,
-            er_exec_p95_ms = ?er_exec_p95_ms,
-            "evaluating self-check (fee-based gate)"
-        );
-
-        self_check_failures.extend(fee_based_self_check_failures(
-            fee_savings_ratio,
-            er_exec_p95_ms,
-        ));
-
-        if er_success_rate < 0.99 {
-            self_check_failures.push(format!(
-                "ER success rate {:.3} below 0.99 threshold",
-                er_success_rate
-            ));
-        }
-        if er_fallback_rate > 0.05 {
-            self_check_failures.push(format!(
-                "ER fallback rate {:.3} exceeds 0.05 threshold",
-                er_fallback_rate
-            ));
-        }
-    }
-
-    if !self_check_failures.is_empty() {
-        println!("\nSELF-CHECK FAILED:");
-        for msg in &self_check_failures {
-            println!("- {}", msg);
-        }
-        println!(
-            "info: CU savings ratio {:.2}% (informational gate only)",
-            cu_savings_ratio * 100.0
-        );
-        if !er_chunk_rows.is_empty() {
-            let mut by_cu: Vec<&ErChunkSummaryRow> = er_chunk_rows
-                .iter()
-                .filter(|row| row.session_established)
-                .collect();
-            by_cu.sort_by_key(|row| Reverse(row.used_cu));
-            if !by_cu.is_empty() {
-                println!("Top ER chunks by CU:");
-                for (idx, row) in by_cu.iter().take(3).enumerate() {
-                    println!(
-                        "  {}. layer {} chunk #{} -> used_cu {} latency_ms {}",
-                        idx + 1,
-                        row.layer,
-                        row.chunk,
-                        row.used_cu,
-                        row.total_ms
-                    );
-                }
-            }
-
-            let mut by_latency: Vec<&ErChunkSummaryRow> = er_chunk_rows
-                .iter()
-                .filter(|row| row.session_established)
-                .collect();
-            by_latency.sort_by_key(|row| Reverse(row.total_ms));
-            if !by_latency.is_empty() {
-                println!("Top ER chunks by latency:");
-                for (idx, row) in by_latency.iter().take(3).enumerate() {
-                    println!(
-                        "  {}. layer {} chunk #{} -> latency_ms {} used_cu {}",
-                        idx + 1,
-                        row.layer,
-                        row.chunk,
-                        row.total_ms,
-                        row.used_cu
-                    );
-                }
-            }
-        }
-        anyhow::bail!("self-check thresholds not met");
-    } else if args.er_enabled && er_real_chunks > 0 && !args.dry_run {
-        println!("\nSELF-CHECK PASSED (fee-based gate).");
-        println!(
-            "info: CU savings ratio {:.2}% (informational gate only)",
-            cu_savings_ratio * 100.0
-        );
-    }
-
-    let er_perf_summary = er_summary.as_ref().map(|summary| ErPerformanceSummary {
-        settlements: er_chunks_total,
-        settlement_cu_total: er_cu_total,
-        settlement_cu_avg: if er_chunks_total > 0 {
-            Some(er_avg_cu)
-        } else {
-            None
-        },
-        settlement_fee_total: er_fee_total,
-        settlement_fee_avg: if er_chunks_total > 0 {
-            Some(er_avg_fee)
-        } else {
-            None
-        },
-        baseline_cu_total,
-        baseline_fee_total: baseline_total,
-        cu_savings_ratio,
-        fee_savings_ratio,
-        latency_ms_p50: er_latency_p50_ms,
-        latency_ms_p95: er_latency_p95_ms,
-        latency_ms_stddev: er_latency_stddev,
-        latency_ms_variance: er_latency_variance,
-        baseline_latency_ms_p50: baseline_latency_p50_ms,
-        baseline_latency_ms_p95: baseline_latency_p95_ms,
-        baseline_latency_ms_stddev: baseline_latency_stddev,
-        baseline_latency_ms_variance: baseline_latency_variance,
-        exec_ms_p50: er_exec_p50_ms,
-        exec_ms_p95: er_exec_p95_ms,
-        exec_ms_stddev: er_exec_stddev,
-        exec_ms_variance: er_exec_variance,
-        plan_fingerprint_coverage: plan_fp_coverage,
-        er_success_rate,
-        er_fallback_rate,
-        router: router_health_summary.clone(),
-        session_begin_attempts: summary.session_begin_attempts,
-        session_begin_ok: summary.session_begin_ok,
-        session_begin_err: summary.session_begin_err,
-        last_router_error_code: summary.last_router_error_code,
-        last_router_error_message: summary.last_router_error_message.clone(),
-        skipped_small_chunks: summary.small_chunk_skips,
-        merged_small_chunks: summary.merged_small_chunks,
-    });
-
-    let report = DemoReport {
-        intents: dag.nodes.len(),
-        dag_layers: layers_sizes,
-        rollup_chunks: rollup_reports.len(),
-        rollup_total_fee: rollup_total,
-        baseline_txs: baseline.len(),
-        baseline_total_fee: baseline_total,
-        absolute_savings_lamports: savings_abs,
-        savings_percent: (savings_pct * 100.0).round() / 100.0,
-        rollup_txs: rollup_reports.clone(),
-        baseline: baseline.clone(),
-    };
-
-    // Collect final metrics
-    let final_rpc_metrics = global_rpc_metrics_snapshot();
-
-    // Create tracing report
-    let run_mode = match args.cu_scope {
-        CuScopeCli::Global => "default".to_string(),
-        CuScopeCli::PerLayer => "per-layer".to_string(),
-    };
-
-    let tracing_report = TracingReport {
-        run_mode,
-        stages: vec![
-            StageMetric {
-                name: "dag.build".to_string(),
-                count: 1,
-                total_ms: dag_duration.as_millis() as u64,
-            },
-            StageMetric {
-                name: "rollup.execution".to_string(),
-                count: rollup_reports.len() as u64,
-                total_ms: 0,
-            },
-        ],
-        rpc: final_rpc_metrics.clone(),
-        mock_in_use,
-        rpc_url: rpc_base_url.clone(),
-    };
-
-    println!("=== TRACING REPORT JSON ===");
-    println!("{}", serde_json::to_string_pretty(&tracing_report)?);
-
-    println!("\n=== CPSR-Lite Demo Report ===");
-    println!("intents: {}", report.intents);
-    println!("dag layers: {:?}", report.dag_layers);
-    println!(
-        "rollup: {} chunk txs, total fee {} lamports",
-        report.rollup_chunks, report.rollup_total_fee
-    );
-    if args.compare_baseline {
-        println!(
-            "baseline: {} txs, total fee {} lamports",
-            report.baseline_txs, report.baseline_total_fee
-        );
-        println!(
-            "savings: {} lamports ({:.2}%)",
-            report.absolute_savings_lamports, report.savings_percent
-        );
-    }
-
-    let bh_metrics = blockhash_manager.metrics();
-    println!("\n=== BLOCKHASH METRICS ===");
-    println!(
-        "refresh_initial            : {}",
-        bh_metrics.refresh_initial
-    );
-    println!("refresh_manual             : {}", bh_metrics.refresh_manual);
-    println!("refresh_age                : {}", bh_metrics.refresh_age);
-    println!("refresh_quota              : {}", bh_metrics.refresh_quota);
-    println!("refresh_layer_boundary     : {}", bh_metrics.refresh_layer);
-    println!(
-        "refresh_validation_failed  : {}",
-        bh_metrics.refresh_validation
-    );
-    println!("leases_issued              : {}", bh_metrics.leases_issued);
-    let stale_pct = if bh_metrics.leases_issued > 0 {
-        (bh_metrics.stale_detected as f64 * 100.0) / (bh_metrics.leases_issued as f64)
-    } else {
-        0.0
-    };
-    println!(
-        "stale_detected            : {} ({:.3}%)",
-        bh_metrics.stale_detected, stale_pct
-    );
-
-    let alt_metrics = alt_mgr.metrics();
-    println!("\n=== ALT METRICS ===");
-    println!(
-        "resolutions               : {}",
-        alt_metrics.total_resolutions
-    );
-    let hit_pct = if alt_metrics.total_resolutions > 0 {
-        (alt_metrics.cache_hits as f64 * 100.0) / (alt_metrics.total_resolutions as f64)
-    } else {
-        0.0
-    };
-    println!(
-        "cache_hits                : {} ({:.2}%)",
-        alt_metrics.cache_hits, hit_pct
-    );
-    println!("keys_offloaded            : {}", alt_metrics.keys_offloaded);
-    println!(
-        "readonly_offloaded        : {}",
-        alt_metrics.readonly_offloaded
-    );
-    println!(
-        "writable_offloaded        : {}",
-        alt_metrics.writable_offloaded
-    );
-    println!(
-        "estimated_bytes_saved     : {}",
-        alt_metrics.estimated_saved_bytes
-    );
-
-    println!("\n=== LAYER SUMMARIES ===");
-    for summary in &layer_summaries {
-        println!(
-            "layer {:02}: chunks={} success={} failure={} wall_clock_ms={}",
-            summary.index,
-            summary.chunks,
-            summary.success,
-            summary.failure,
-            summary.wall_clock.as_millis()
-        );
-    }
-
-    let occ_metrics = occ_metrics_snapshot();
-    println!("\n=== OCC METRICS ===");
-    println!("captures                  : {}", occ_metrics.captures);
-    println!("retries                   : {}", occ_metrics.retries);
-    println!(
-        "slot_drift_rejects        : {}",
-        occ_metrics.slot_drift_rejects
-    );
-    println!("rpc_errors                : {}", occ_metrics.rpc_errors);
-
-    println!("\n=== RPC METRICS ===");
-    println!("| Metric                     | Count |");
-    println!("|----------------------------|-------|");
-    println!(
-        "| simulateTransaction        | {:5} |",
-        final_rpc_metrics.simulate
-    );
-    println!(
-        "| isBlockhashValid           | {:5} |",
-        final_rpc_metrics.is_blockhash_valid
-    );
-    println!(
-        "| getLatestBlockhash         | {:5} |",
-        final_rpc_metrics.get_latest_blockhash
-    );
-    println!(
-        "| getRecentPrioritizationFees| {:5} |",
-        final_rpc_metrics.get_recent_prioritization_fees
-    );
-    println!(
-        "| sendTransaction            | {:5} |",
-        final_rpc_metrics.send_transaction
-    );
-
-    if let Some(path) = args.out_report {
-        let combined_report = serde_json::json!({
-            "demo": report,
-            "tracing": tracing_report,
-            "er": er_perf_summary,
-        });
-        let json = serde_json::to_string_pretty(&combined_report)?;
-        fs::write(&path, json)?;
-        println!("wrote JSON report to {:?}", path);
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

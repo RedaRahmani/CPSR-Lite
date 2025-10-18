@@ -42,7 +42,7 @@ url = "2"
 bs58 = "0.4"
 base64 = "0.21"
 async-trait = "0.1"
+chrono = { version = "0.4", features = ["clock"] }
 
 [dev-dependencies]
 wiremock = "0.6"
-chrono = { version = "0.4", features = ["clock"] }
