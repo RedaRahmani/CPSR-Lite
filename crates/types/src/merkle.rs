@@ -1,4 +1,4 @@
-use crate::hash::{Hash32, blake3_concat, ZERO32};
+use crate::hash::{blake3_concat, Hash32, ZERO32};
 
 /// Bottom-up Merkle root; duplicates the last leaf on odd layers (Bitcoin-style).
 pub fn merkle_root(mut leaves: Vec<Hash32>) -> Hash32 {
@@ -19,8 +19,6 @@ pub fn merkle_root(mut leaves: Vec<Hash32>) -> Hash32 {
     }
     leaves[0]
 }
-
-
 
 #[cfg(test)]
 mod tests {

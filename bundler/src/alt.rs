@@ -197,11 +197,20 @@ impl CachingAltManager {
                 .iter()
                 .filter(|u| resolvable.contains(&u.pubkey))
                 .fold((0usize, 0usize), |(ro, wr), u| {
-                    if u.writable { (ro, wr + 1) } else { (ro + 1, wr) }
+                    if u.writable {
+                        (ro, wr + 1)
+                    } else {
+                        (ro + 1, wr)
+                    }
                 });
 
-            let saved = estimate_saved_bytes(&self.policy,
-                &offload.into_iter().filter(|u| resolvable.contains(&u.pubkey)).collect::<Vec<_>>());
+            let saved = estimate_saved_bytes(
+                &self.policy,
+                &offload
+                    .into_iter()
+                    .filter(|u| resolvable.contains(&u.pubkey))
+                    .collect::<Vec<_>>(),
+            );
 
             let resolution = AltResolution {
                 tables,
@@ -280,7 +289,7 @@ impl CachingAltManager {
 
 impl AltManager for CachingAltManager {
     fn resolve_tables(&self, payer: Pubkey, intents: &[UserIntent]) -> AltResolution {
-        let mut resolution = self.compute_offload_plan(payer, intents);
+        let resolution = self.compute_offload_plan(payer, intents);
 
         // Cache hit detection for the real-catalog path (key not based on KeyUsage struct)
         if resolution.tables.is_empty() && self.catalog.is_some() {

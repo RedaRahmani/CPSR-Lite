@@ -1,8 +1,8 @@
-use serde::{Serialize, Deserialize, Deserializer, Serializer};
 use serde::de::Error as DeError;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use solana_program::{
+    instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
-    instruction::{Instruction, AccountMeta},
 };
 use std::str::FromStr;
 
@@ -58,11 +58,15 @@ impl From<Instruction> for InstructionSer {
     fn from(ix: Instruction) -> Self {
         Self {
             program_id: ix.program_id,
-            accounts: ix.accounts.into_iter().map(|m| AccountMetaSer {
-                pubkey: m.pubkey,
-                is_signer: m.is_signer,
-                is_writable: m.is_writable,
-            }).collect(),
+            accounts: ix
+                .accounts
+                .into_iter()
+                .map(|m| AccountMetaSer {
+                    pubkey: m.pubkey,
+                    is_signer: m.is_signer,
+                    is_writable: m.is_writable,
+                })
+                .collect(),
             data: ix.data,
         }
     }
@@ -72,11 +76,15 @@ impl From<InstructionSer> for Instruction {
     fn from(s: InstructionSer) -> Self {
         Instruction {
             program_id: s.program_id,
-            accounts: s.accounts.into_iter().map(|m| AccountMeta {
-                pubkey: m.pubkey,
-                is_signer: m.is_signer,
-                is_writable: m.is_writable,
-            }).collect(),
+            accounts: s
+                .accounts
+                .into_iter()
+                .map(|m| AccountMeta {
+                    pubkey: m.pubkey,
+                    is_signer: m.is_signer,
+                    is_writable: m.is_writable,
+                })
+                .collect(),
             data: s.data,
         }
     }
@@ -93,8 +101,6 @@ pub mod serde_instruction {
         Ok(Instruction::from(ser))
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -119,7 +125,9 @@ mod tests {
         ix: Instruction,
     }
 
-    fn k() -> Pubkey { Pubkey::new_unique() }
+    fn k() -> Pubkey {
+        Pubkey::new_unique()
+    }
 
     #[test]
     fn pubkey_base58_roundtrip() {
@@ -152,7 +160,7 @@ mod tests {
                 AccountMeta::new(k(), true),
                 AccountMeta::new_readonly(k(), false),
             ],
-            data: vec![1,2,3,4,5],
+            data: vec![1, 2, 3, 4, 5],
         };
         let ser = InstructionSer::from(ix.clone());
         let j = serde_json::to_string(&ser).unwrap();
@@ -174,7 +182,7 @@ mod tests {
         let ix = Instruction {
             program_id: k(),
             accounts: vec![AccountMeta::new(k(), false)],
-            data: vec![9,9,9],
+            data: vec![9, 9, 9],
         };
         let wrap = IxWrap { ix: ix.clone() };
         let j = serde_json::to_string(&wrap).unwrap();

@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use solana_program::instruction::Instruction;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,7 +12,15 @@ pub struct SizeEstimate {
 }
 
 #[inline]
-fn shortvec_len(n: usize) -> u32 { if n < 128 { 1 } else if n < 16384 { 2 } else { 3 } }
+fn shortvec_len(n: usize) -> u32 {
+    if n < 128 {
+        1
+    } else if n < 16384 {
+        2
+    } else {
+        3
+    }
+}
 
 /// Compiled instruction size: 1 (program idx) + sv(accs) + accs + sv(data) + data_len
 #[inline]
@@ -77,34 +85,60 @@ pub fn fold_message_size(estimates: &[SizeEstimate], bytes_slack: u32) -> u32 {
     sum + bytes_slack
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_program::{instruction::{Instruction, AccountMeta}, pubkey::Pubkey};
+    use solana_program::{
+        instruction::{AccountMeta, Instruction},
+        pubkey::Pubkey,
+    };
 
     fn ix(n_accounts: usize, data_len: usize) -> Instruction {
         let program = Pubkey::new_unique();
         let accounts = (0..n_accounts)
             .map(|_| AccountMeta::new(Pubkey::new_unique(), false))
             .collect::<Vec<_>>();
-        Instruction { program_id: program, accounts, data: vec![0u8; data_len] }
+        Instruction {
+            program_id: program,
+            accounts,
+            data: vec![0u8; data_len],
+        }
     }
 
     #[test]
     fn compiled_bytes_formula() {
         let i = ix(2, 3);
         let b = compiled_ix_bytes(&i);
-        let sv = |n: usize| if n < 128 { 1 } else if n < 16384 { 2 } else { 3 };
+        let sv = |n: usize| {
+            if n < 128 {
+                1
+            } else if n < 16384 {
+                2
+            } else {
+                3
+            }
+        };
         assert_eq!(b, (1 + sv(2) + 2 + sv(3) + 3) as u32);
     }
 
     #[test]
     fn message_bytes_increase_with_keys_and_lookups() {
         let ixs = vec![ix(1, 0), ix(2, 1)];
-        let base  = V0MessageShape { message_keys: 5,  lookup_tables: vec![],      instr_count: ixs.len() };
-        let keys  = V0MessageShape { message_keys: 10, lookup_tables: vec![],      instr_count: ixs.len() };
-        let withl = V0MessageShape { message_keys: 5,  lookup_tables: vec![(2,1)], instr_count: ixs.len() };
+        let base = V0MessageShape {
+            message_keys: 5,
+            lookup_tables: vec![],
+            instr_count: ixs.len(),
+        };
+        let keys = V0MessageShape {
+            message_keys: 10,
+            lookup_tables: vec![],
+            instr_count: ixs.len(),
+        };
+        let withl = V0MessageShape {
+            message_keys: 5,
+            lookup_tables: vec![(2, 1)],
+            instr_count: ixs.len(),
+        };
 
         let b0 = estimate_message_v0_bytes(&ixs, &base);
         let b1 = estimate_message_v0_bytes(&ixs, &keys);

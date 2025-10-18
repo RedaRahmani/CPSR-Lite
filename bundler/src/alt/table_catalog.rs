@@ -2,11 +2,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{anyhow, Result};
 use solana_client::rpc_client::RpcClient;
-use solana_program::address_lookup_table::{
-    program::ID as ALT_PROGRAM_ID,
-    state::AddressLookupTable,
-};
 use solana_program::address_lookup_table::AddressLookupTableAccount;
+use solana_program::address_lookup_table::{
+    program::ID as ALT_PROGRAM_ID, state::AddressLookupTable,
+};
 use solana_sdk::pubkey::Pubkey;
 use tracing::{info, warn};
 
@@ -70,7 +69,9 @@ impl TableCatalog {
         let mut reverse: HashMap<Pubkey, (Pubkey, u8)> = HashMap::new();
         for t in &tables {
             for (i, pk) in t.addresses.iter().enumerate() {
-                if i >= u8::MAX as usize { break; }
+                if i >= u8::MAX as usize {
+                    break;
+                }
                 reverse.insert(*pk, (t.key, i as u8));
             }
         }
@@ -94,7 +95,8 @@ impl TableCatalog {
         if used_tables.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let tables: Vec<_> = self.tables
+        let tables: Vec<_> = self
+            .tables
             .iter()
             .filter(|t| used_tables.contains(&t.key))
             .cloned()

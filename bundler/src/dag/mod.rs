@@ -38,10 +38,10 @@
 //!
 //! Unit tests at the bottom cover basic hazards and layer extraction.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 /// HashSet is a data structure that stores unique items — no duplicates allowed
-use cpsr_types::{intent::{AccessKind, AccountAccess, UserIntent}};
+use cpsr_types::intent::{AccessKind, AccountAccess, UserIntent};
 use solana_program::pubkey::Pubkey;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Node identifier inside the DAG (index into Dag::nodes)
 pub type NodeId = u32;
@@ -120,10 +120,11 @@ impl Dag {
             let node_id = idx as NodeId;
             let key = (-(intent.priority as i32), idx as u32); // DESC priority, ASC index
             for AccountAccess { pubkey, access } in &intent.accesses {
-                by_account
-                    .entry(*pubkey)
-                    .or_default()
-                    .push(Participant { node: node_id, access: *access, sort_key: key });
+                by_account.entry(*pubkey).or_default().push(Participant {
+                    node: node_id,
+                    access: *access,
+                    sort_key: key,
+                });
             }
         }
 
@@ -132,7 +133,10 @@ impl Dag {
         // inside Dag::build (replace the per-account loop)
         for (account, mut parts) in by_account {
             // Skip pure R/R
-            if parts.iter().all(|p| matches!(p.access, AccessKind::ReadOnly)) {
+            if parts
+                .iter()
+                .all(|p| matches!(p.access, AccessKind::ReadOnly))
+            {
                 continue;
             }
             // Sort by deterministic key: priority desc, index asc.
@@ -163,7 +167,6 @@ impl Dag {
             }
         }
 
-
         // Deduplicate conflicts by (account, a, b)
         let mut uniq = HashSet::new();
         for c in conflict_buf {
@@ -181,7 +184,7 @@ impl Dag {
         let n = self.nodes.len();
         let mut indeg = vec![0u32; n];
         for v in 0..n {
-            for &u in &self.rev_edges[v] {
+            for &_ in &self.rev_edges[v] {
                 indeg[v] = indeg[v].saturating_add(1);
             }
         }
@@ -218,7 +221,7 @@ impl Dag {
         let n = self.nodes.len();
         let mut indeg = vec![0u32; n];
         for v in 0..n {
-            for &u in &self.rev_edges[v] {
+            for &_ in &self.rev_edges[v] {
                 indeg[v] = indeg[v].saturating_add(1);
             }
         }
@@ -262,12 +265,18 @@ impl Dag {
 
     /// Return all outgoing neighbors of node `u`.
     pub fn neighbors(&self, u: NodeId) -> Result<&[NodeId], DagError> {
-        self.edges.get(u as usize).map(|v| v.as_slice()).ok_or(DagError::IndexOob)
+        self.edges
+            .get(u as usize)
+            .map(|v| v.as_slice())
+            .ok_or(DagError::IndexOob)
     }
 
     /// Return all incoming neighbors of node `v`.
     pub fn predecessors(&self, v: NodeId) -> Result<&[NodeId], DagError> {
-        self.rev_edges.get(v as usize).map(|v| v.as_slice()).ok_or(DagError::IndexOob)
+        self.rev_edges
+            .get(v as usize)
+            .map(|v| v.as_slice())
+            .ok_or(DagError::IndexOob)
     }
 }
 
@@ -277,7 +286,10 @@ impl Dag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_program::{instruction::{AccountMeta, Instruction}, pubkey::Pubkey};
+    use solana_program::{
+        instruction::{AccountMeta, Instruction},
+        pubkey::Pubkey,
+    };
 
     fn mk_intent(
         actor: Pubkey,
@@ -286,17 +298,35 @@ mod tests {
         data: Vec<u8>,
         priority: u8,
     ) -> UserIntent {
-        let metas: Vec<AccountMeta> = accounts.iter()
-            .map(|(k, w)| if *w { AccountMeta::new(*k, false) } else { AccountMeta::new_readonly(*k, false) })
+        let metas: Vec<AccountMeta> = accounts
+            .iter()
+            .map(|(k, w)| {
+                if *w {
+                    AccountMeta::new(*k, false)
+                } else {
+                    AccountMeta::new_readonly(*k, false)
+                }
+            })
             .collect();
-        let accesses = accounts.iter().map(|(k, w)| {
-            let access = if *w { AccessKind::Writable } else { AccessKind::ReadOnly };
-            AccountAccess { pubkey: *k, access }
-        }).collect();
+        let accesses = accounts
+            .iter()
+            .map(|(k, w)| {
+                let access = if *w {
+                    AccessKind::Writable
+                } else {
+                    AccessKind::ReadOnly
+                };
+                AccountAccess { pubkey: *k, access }
+            })
+            .collect();
 
         UserIntent {
             actor,
-            ix: Instruction { program_id: program, accounts: metas, data },
+            ix: Instruction {
+                program_id: program,
+                accounts: metas,
+                data,
+            },
             accesses,
             priority,
             expires_at_slot: None,
@@ -345,7 +375,7 @@ mod tests {
 
         // i0 reads a (prio 5), i1 writes a (prio 4) -> both participate; chain by order key (i0 before i1)
         let i0 = mk_intent(actor, prog, &[(a, false)], vec![0], 5);
-        let i1 = mk_intent(actor, prog, &[(a, true)],  vec![1], 4);
+        let i1 = mk_intent(actor, prog, &[(a, true)], vec![1], 4);
 
         let dag = Dag::build(vec![i0, i1]);
         let order = dag.topo_order().unwrap();

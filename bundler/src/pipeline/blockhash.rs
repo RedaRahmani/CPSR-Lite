@@ -2,11 +2,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use cpsr_types::UserIntent;
 use solana_client::rpc_client::RpcClient;
-use solana_sdk::{commitment_config::CommitmentConfig, hash::Hash};
+use solana_sdk::{commitment_config::CommitmentConfig, hash::Hash, pubkey::Pubkey};
 use tracing::{info, warn};
 
-use crate::sender::{track_get_latest_blockhash, track_is_blockhash_valid};
+use crate::{
+    er::bhfa::{collect_writables_or_payer, get_blockhash_for_accounts, BhfaConfig},
+    sender::{track_get_latest_blockhash, track_is_blockhash_valid},
+};
 
 /// Why a blockhash refresh occurred.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,8 +68,13 @@ pub struct BlockhashMetrics {
     pub stale_detected: u64,
 }
 
+#[async_trait]
 pub trait BlockhashProvider: Send + Sync {
-    fn lease(&self) -> Result<BlockhashLease>;
+    async fn lease(&self) -> Result<BlockhashLease>;
+    async fn lease_for_intents(&self, intents: &[UserIntent]) -> Result<BlockhashLease> {
+        let _ = intents;
+        self.lease().await
+    }
     fn record_outcome(&self, lease: &BlockhashLease, outcome: LeaseOutcome);
     fn mark_layer_boundary(&self);
     fn metrics(&self) -> BlockhashMetrics;
@@ -104,16 +114,15 @@ impl BlockhashManager {
             commitment,
             policy,
             pre_check,
-            state: Mutex::new(BlockhashInner { current: None, pending_refresh: Some(RefreshReason::Initial) }),
+            state: Mutex::new(BlockhashInner {
+                current: None,
+                pending_refresh: Some(RefreshReason::Initial),
+            }),
             metrics: Mutex::new(BlockhashMetrics::default()),
         }
     }
 
-    fn refresh_with_reason(
-        &self,
-        inner: &mut BlockhashInner,
-        reason: RefreshReason,
-    ) -> Result<()> {
+    fn refresh_with_reason(&self, inner: &mut BlockhashInner, reason: RefreshReason) -> Result<()> {
         track_get_latest_blockhash();
         let now = Instant::now();
         let (hash, last_valid_block_height) = self
@@ -131,7 +140,10 @@ impl BlockhashManager {
         self.bump_refresh_metric(reason);
         self.log_refresh(&lease, reason);
 
-        inner.current = Some(BlockhashState { lease, uses_since_refresh: 0 });
+        inner.current = Some(BlockhashState {
+            lease,
+            uses_since_refresh: 0,
+        });
         inner.pending_refresh = None;
 
         Ok(())
@@ -173,8 +185,9 @@ impl BlockhashManager {
     }
 }
 
+#[async_trait]
 impl BlockhashProvider for BlockhashManager {
-    fn lease(&self) -> Result<BlockhashLease> {
+    async fn lease(&self) -> Result<BlockhashLease> {
         loop {
             let (lease, needs_check) = {
                 let mut inner = self.state.lock().expect("blockhash state mutex");
@@ -207,12 +220,15 @@ impl BlockhashProvider for BlockhashManager {
                     .is_blockhash_valid(&lease.hash, self.commitment.clone())
                 {
                     Ok(true) => {
-                        self.metrics.lock().expect("blockhash metrics mutex").leases_issued += 1;
+                        self.metrics
+                            .lock()
+                            .expect("blockhash metrics mutex")
+                            .leases_issued += 1;
                         return Ok(lease);
                     }
                     Ok(false) => {
                         // Gentle anti-spin: avoid a tight loop against flaky RPCs.
-                        std::thread::sleep(Duration::from_millis(25));
+                        tokio::time::sleep(Duration::from_millis(25)).await;
                         warn!(target: "blockhash", "blockhash invalidated; fetching a new one");
                         let mut inner = self.state.lock().expect("blockhash state mutex");
                         inner.current = None;
@@ -222,7 +238,10 @@ impl BlockhashProvider for BlockhashManager {
                     Err(err) => return Err(anyhow!("isBlockhashValid: {err}")),
                 }
             } else {
-                self.metrics.lock().expect("blockhash metrics mutex").leases_issued += 1;
+                self.metrics
+                    .lock()
+                    .expect("blockhash metrics mutex")
+                    .leases_issued += 1;
                 return Ok(lease);
             }
         }
@@ -230,7 +249,10 @@ impl BlockhashProvider for BlockhashManager {
 
     fn record_outcome(&self, lease: &BlockhashLease, outcome: LeaseOutcome) {
         if matches!(outcome, LeaseOutcome::StaleDetected) {
-            self.metrics.lock().expect("blockhash metrics mutex").stale_detected += 1;
+            self.metrics
+                .lock()
+                .expect("blockhash metrics mutex")
+                .stale_detected += 1;
             let mut inner = self.state.lock().expect("blockhash state mutex");
             inner.current = None;
             inner.pending_refresh = Some(RefreshReason::Manual);
@@ -244,6 +266,69 @@ impl BlockhashProvider for BlockhashManager {
     }
 
     fn metrics(&self) -> BlockhashMetrics {
-        self.metrics.lock().expect("blockhash metrics mutex").clone()
+        self.metrics
+            .lock()
+            .expect("blockhash metrics mutex")
+            .clone()
+    }
+}
+
+/// Blockhash provider that attempts Magic Router BHFA before falling back to the baseline manager.
+pub struct ErAwareBlockhashProvider {
+    inner: Arc<BlockhashManager>,
+    cfg: BhfaConfig,
+    payer: Pubkey,
+}
+
+impl ErAwareBlockhashProvider {
+    pub fn new(inner: Arc<BlockhashManager>, cfg: BhfaConfig, payer: Pubkey) -> Self {
+        Self { inner, cfg, payer }
+    }
+}
+
+#[async_trait]
+impl BlockhashProvider for ErAwareBlockhashProvider {
+    async fn lease(&self) -> Result<BlockhashLease> {
+        self.inner.lease().await
+    }
+
+    async fn lease_for_intents(&self, intents: &[UserIntent]) -> Result<BlockhashLease> {
+        let accounts = collect_writables_or_payer(intents, self.payer);
+        match get_blockhash_for_accounts(&self.cfg, &accounts).await {
+            Ok((hash, last_valid_block_height)) => {
+                info!(
+                    target: "blockhash",
+                    source = "BHFA",
+                    accounts = %accounts.len(),
+                    "using ER-aware blockhash"
+                );
+                Ok(BlockhashLease {
+                    hash,
+                    last_valid_block_height,
+                    fetched_at: Instant::now(),
+                    refresh_reason: RefreshReason::Manual,
+                })
+            }
+            Err(err) => {
+                warn!(
+                    target: "blockhash",
+                    "BHFA failed; falling back to L1: {:#}",
+                    err
+                );
+                self.inner.lease_for_intents(intents).await
+            }
+        }
+    }
+
+    fn record_outcome(&self, lease: &BlockhashLease, outcome: LeaseOutcome) {
+        self.inner.record_outcome(lease, outcome);
+    }
+
+    fn mark_layer_boundary(&self) {
+        self.inner.mark_layer_boundary();
+    }
+
+    fn metrics(&self) -> BlockhashMetrics {
+        self.inner.metrics()
     }
 }

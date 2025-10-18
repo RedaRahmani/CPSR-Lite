@@ -1,10 +1,12 @@
 // bundler/src/sender.rs
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use crate::fee::{FeeOracle, FeePlan};
+use anyhow::{anyhow, Result};
+use estimator::cost::apply_safety_with_cap;
 use solana_client::{
     rpc_client::RpcClient,
     rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
@@ -16,8 +18,6 @@ use solana_sdk::{
     signer::Signer,
     transaction::VersionedTransaction,
 };
-use estimator::cost::apply_safety_with_cap;
-use crate::fee::{FeeOracle, FeePlan};
 
 // Global RPC metrics counters
 static RPC_SIMULATE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -60,16 +60,16 @@ pub fn track_get_recent_prioritization_fees() {
 
 #[derive(Clone, Debug)]
 pub struct SendReport {
-    pub signature: Option<Signature>,       // None in dry-run
-    pub used_cu: u32,                       // from simulation
-    pub final_plan: FeePlan,                // cu_limit + price used to build the final msg
-    pub message_bytes: usize,               // serialized vmsg size (no signatures)
-    pub required_signers: usize,            // from message header
-    pub base_fee_lamports: u64,             // 5000 * required_signers
-    pub priority_fee_lamports: u64,         // (cu_limit * cu_price_microLam) / 1_000_000
-    pub total_fee_lamports: u64,            // base + priority (excludes rent, etc.)
-    pub simulate_duration: Duration,        // wall-clock duration of simulate_transaction
-    pub send_duration: Option<Duration>,    // wall-clock duration of send_transaction (None when dry-run)
+    pub signature: Option<Signature>,    // None in dry-run
+    pub used_cu: u32,                    // from simulation
+    pub final_plan: FeePlan,             // cu_limit + price used to build the final msg
+    pub message_bytes: usize,            // serialized vmsg size (no signatures)
+    pub required_signers: usize,         // from message header
+    pub base_fee_lamports: u64,          // 5000 * required_signers
+    pub priority_fee_lamports: u64,      // (cu_limit * cu_price_microLam) / 1_000_000
+    pub total_fee_lamports: u64,         // base + priority (excludes rent, etc.)
+    pub simulate_duration: Duration,     // wall-clock duration of simulate_transaction
+    pub send_duration: Option<Duration>, // wall-clock duration of send_transaction (None when dry-run)
 }
 
 /// Maintains a sliding window of recent used CU to compute P95.
@@ -79,18 +79,31 @@ struct CuStats {
     cap: usize, // max samples to keep
 }
 impl CuStats {
-    fn new(cap: usize) -> Self { Self { window: VecDeque::with_capacity(cap), cap } }
-    fn clear(&mut self) { self.window.clear(); }
+    fn new(cap: usize) -> Self {
+        Self {
+            window: VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+    fn clear(&mut self) {
+        self.window.clear();
+    }
     fn record(&mut self, used: u32) {
-        if self.window.len() == self.cap { self.window.pop_front(); }
+        if self.window.len() == self.cap {
+            self.window.pop_front();
+        }
         self.window.push_back(used);
     }
     fn p95(&self) -> Option<u32> {
-        if self.window.is_empty() { return None; }
+        if self.window.is_empty() {
+            return None;
+        }
         let mut v: Vec<u32> = self.window.iter().copied().collect();
         v.sort_unstable();
         let n = v.len();
-        let idx = (((n as f64) * 0.95).ceil() as usize).saturating_sub(1).min(n - 1);
+        let idx = (((n as f64) * 0.95).ceil() as usize)
+            .saturating_sub(1)
+            .min(n - 1);
         Some(v[idx])
     }
 }
@@ -146,7 +159,9 @@ impl ReliableSender {
     /// If scope == PerScope, call this at the start of each logical scope (e.g., each DAG layer).
     pub fn start_scope(&self) {
         if let CuScope::PerScope = self.scope {
-            if let Ok(mut s) = self.stats.lock() { s.clear(); }
+            if let Ok(mut s) = self.stats.lock() {
+                s.clear();
+            }
         }
     }
 
@@ -174,7 +189,7 @@ impl ReliableSender {
         // 2) Build & simulate to learn units.
         let vmsg0 = build(plan0.clone())?;
         let tx0 = VersionedTransaction::try_new(vmsg0.clone(), signers)?;
-        
+
         let sim_start = Instant::now();
         let sim = self.rpc.simulate_transaction_with_config(
             &tx0,
@@ -220,7 +235,8 @@ impl ReliableSender {
         // Base fee: 5000 lamports per signature (runtime constant).
         let base_fee_lamports = 5000u64 * (required_signers as u64);
         // Priority fee: limit * price (μLam) -> lamports
-        let priority_fee_lamports = (plan.cu_limit.saturating_mul(plan.cu_price_microlamports)) / 1_000_000;
+        let priority_fee_lamports =
+            (plan.cu_limit.saturating_mul(plan.cu_price_microlamports)) / 1_000_000;
         let mut signature = None;
 
         tracing::info!(
@@ -242,20 +258,22 @@ impl ReliableSender {
                     VersionedMessage::Legacy(m) => m.recent_blockhash,
                     VersionedMessage::V0(m) => m.recent_blockhash,
                 };
-                
+
                 let blockhash_start = Instant::now();
-                let ok = self.rpc.is_blockhash_valid(&bh, CommitmentConfig::processed())?;
+                let ok = self
+                    .rpc
+                    .is_blockhash_valid(&bh, CommitmentConfig::processed())?;
                 let blockhash_duration = blockhash_start.elapsed();
                 RPC_IS_BLOCKHASH_VALID_COUNT.fetch_add(1, Ordering::Relaxed);
                 tracing::info!("is_blockhash_valid took {:?}", blockhash_duration);
-                
+
                 if !ok {
                     return Err(anyhow!("stale blockhash; rebuild required"));
                 }
             }
 
             let tx_final = VersionedTransaction::try_new(vmsg, signers)?;
-            
+
             let send_start = Instant::now();
             let sig = self.rpc.send_transaction_with_config(
                 &tx_final,
@@ -288,7 +306,11 @@ impl ReliableSender {
     }
 
     /// Backwards-compatible wrapper (returns only Signature like before).
-    pub fn simulate_and_send<FBuild>(&self, build: FBuild, signers: &[&dyn Signer]) -> Result<Signature>
+    pub fn simulate_and_send<FBuild>(
+        &self,
+        build: FBuild,
+        signers: &[&dyn Signer],
+    ) -> Result<Signature>
     where
         FBuild: FnMut(FeePlan) -> Result<VersionedMessage>,
     {
@@ -311,10 +333,8 @@ impl ReliableSender {
     {
         tokio::task::spawn_blocking(move || {
             let mut build = build;
-            let signer_refs: Vec<&dyn Signer> = signers
-                .iter()
-                .map(|s| s.as_ref() as &dyn Signer)
-                .collect();
+            let signer_refs: Vec<&dyn Signer> =
+                signers.iter().map(|s| s.as_ref() as &dyn Signer).collect();
             self.simulate_build_and_send_with_report(&mut build, &signer_refs, dry_run)
         })
         .await
