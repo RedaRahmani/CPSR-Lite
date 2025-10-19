@@ -141,7 +141,7 @@ impl CachingAltManager {
             return AltResolution::default();
         }
 
-        let mut entries: Vec<KeyUsage> = usage.into_iter().map(|(_, v)| v).collect();
+    let mut entries: Vec<KeyUsage> = usage.into_values().collect();
 
         // Keys that must remain static: programs + signers.
         let mut must_keep = Vec::new();
@@ -316,13 +316,13 @@ impl AltManager for CachingAltManager {
 
 fn key_cost(usage: &KeyUsage, per_index_byte: i64) -> i64 {
     let static_cost = 32i64 * usage.freq as i64;
-    let alt_cost = (per_index_byte as i64) * usage.freq as i64;
+    let alt_cost = per_index_byte * usage.freq as i64;
     static_cost - alt_cost + if usage.writable { 8 } else { 0 }
 }
 
 fn estimate_saved_bytes(policy: &AltPolicy, offload: &[KeyUsage]) -> usize {
     let static_bytes = 32 * offload.len();
-    let index_bytes = (policy.per_alt_index_byte * offload.len()) as usize;
+    let index_bytes = policy.per_alt_index_byte * offload.len();
     let table_bytes = policy.per_table_fixed_bytes;
     static_bytes.saturating_sub(index_bytes + table_bytes)
 }

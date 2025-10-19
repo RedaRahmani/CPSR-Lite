@@ -315,7 +315,8 @@ impl ReliableSender {
         FBuild: FnMut(FeePlan) -> Result<VersionedMessage>,
     {
         let rep = self.simulate_build_and_send_with_report(build, signers, false)?;
-        Ok(rep.signature.expect("signature missing"))
+        rep.signature
+            .ok_or_else(|| anyhow!("signature missing in send report"))
     }
 
     /// Async wrapper over [`simulate_build_and_send_with_report`] that delegates to a blocking task.

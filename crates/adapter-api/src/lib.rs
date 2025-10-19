@@ -1,9 +1,6 @@
-use cpsr_types::{AccountVersion, Hash32, UserIntent};
+use cpsr_types::AccountVersion;
 use serde::{Deserialize, Serialize};
-use solana_program::{
-    instruction::{AccountMeta, Instruction},
-    pubkey::Pubkey,
-};
+use solana_program::instruction::Instruction;
 
 /// The blueprint for adapters (one adapter per DeFi program, like a driver for each type of machine)
 /// Keeps the system modular — you can add support for new protocols without rewriting the core.

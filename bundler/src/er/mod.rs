@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -40,7 +40,7 @@ pub mod router_client;
 pub use router_client::HttpErClient;
 use solana_sdk::{
     message::{Message, VersionedMessage},
-    signature::Keypair,
+    signature::{Keypair, Signature},
     signer::Signer,
     transaction::VersionedTransaction,
 };
@@ -54,7 +54,7 @@ use std::sync::Arc;
 /// Node probe uses standard `getLatestBlockhash` at the base URL to validate JSON-RPC.
 /// Optional CLI support (`--er-proxy-rpc`) can route simulate/send traffic through the
 /// discovered Magic Router endpoint; Phase-1 execute fallbacks now emit a single info log.
-
+///
 /// Explicit privacy tier for route discovery.
 #[derive(Clone, Copy, Debug)]
 pub enum ErPrivacyMode {
@@ -89,6 +89,10 @@ pub struct ErClientConfig {
     pub blockhash_cache_ttl: Duration,
     pub min_cu_threshold: u64,
     pub merge_small_intents: bool,
+    pub require_router: bool,
+    pub wiretap_verify_blockhash: bool,
+    pub skip_preflight_on_router: bool,
+    pub skip_preflight_on_override: bool,
     pub telemetry: Option<Arc<ErTelemetry>>,
     pub wiretap: Option<Arc<dyn ErWiretap>>,
 }
@@ -105,6 +109,40 @@ pub struct ErRouteInfo {
 pub enum BlockhashSource {
     Router,
     RouteEndpoint,
+}
+
+impl BlockhashSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            BlockhashSource::Router => "router",
+            BlockhashSource::RouteEndpoint => "route_endpoint",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmitPolicy {
+    /// Submit via Magic Router without a local preflight. Chosen when the submit host is the
+    /// Router itself (same-origin as router_url). Used after BHFA sourced from the Router.
+    RouterNoPreflight,
+    /// Submit to a user-provided override RPC with a local simulateTransaction preflight first.
+    /// This is the conservative baseline when BHFA did not come from the Router.
+    RpcSimulateThenSend,
+    /// Submit to the override RPC first; when host parity indicates a blockhash mismatch
+    /// (e.g., JSON-RPC error code -32002 Blockhash not found), retry via Magic Router with
+    /// skipPreflight=true. This preserves latency while ensuring liveness when the override
+    /// lags the Router.
+    OverrideThenRouterParityRetry,
+}
+
+impl SubmitPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SubmitPolicy::RouterNoPreflight => "router_no_preflight",
+            SubmitPolicy::RpcSimulateThenSend => "rpc_simulate_then_send",
+            SubmitPolicy::OverrideThenRouterParityRetry => "override_then_router_parity_retry",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +163,28 @@ pub struct ErBlockhashPlan {
     pub blockhash_fetched_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+pub struct ErHosts {
+    pub bhfa: Url,
+    pub submit: Url,
+}
+
+impl ErClientConfig {
+    pub fn resolve_hosts(&self) -> ErHosts {
+        if let Some(override_url) = &self.endpoint_override {
+            ErHosts {
+                bhfa: self.router_url.clone(),
+                submit: override_url.clone(),
+            }
+        } else {
+            ErHosts {
+                bhfa: self.router_url.clone(),
+                submit: self.router_url.clone(),
+            }
+        }
+    }
+}
+
 /// Unique identifier assigned by MagicBlock for an ER session lifecycle.
 pub type ErSessionId = String;
 
@@ -134,6 +194,7 @@ pub struct ErSession {
     pub id: ErSessionId,
     pub route: ErRouteInfo,
     pub endpoint: Url,
+    pub hosts: ErHosts,
     pub accounts: Vec<Pubkey>,
     pub started_at: Instant,
     pub route_duration: Duration,
@@ -151,6 +212,10 @@ pub struct ErOutput {
     pub exec_duration: Duration,
     pub blockhash_plan: Option<ErBlockhashPlan>,
     pub signature: Option<String>,
+    pub preflight_skipped: bool,
+    pub submit_policy: SubmitPolicy,
+    pub final_submit_host: Url,
+    pub parity_retry: bool,
 }
 
 /// Aggregated telemetry for ER attempts.
@@ -189,6 +254,7 @@ pub struct ErTelemetry {
     dp_end_err: AtomicU64,
     blockhash_plan_hits: AtomicU64,
     blockhash_plan_misses: AtomicU64,
+    parity_retry_router: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -231,6 +297,7 @@ pub struct ErTelemetrySummary {
     pub dp_end_err: u64,
     pub blockhash_plan_hits: u64,
     pub blockhash_plan_misses: u64,
+    pub parity_retry_router: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -278,7 +345,7 @@ impl ErTelemetry {
             self.routes_ok.fetch_add(1, Ordering::Relaxed);
             if let Some(dur) = duration {
                 if let Ok(mut samples) = self.route_ms.lock() {
-                    samples.push(dur.as_millis() as u128);
+                    samples.push(dur.as_millis());
                 }
             }
         } else {
@@ -296,7 +363,7 @@ impl ErTelemetry {
     pub fn record_bhfa_success(&self, duration: Duration) {
         self.bhfa_ok.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut samples) = self.bhfa_ms.lock() {
-            samples.push(duration.as_millis() as u128);
+            samples.push(duration.as_millis());
         }
     }
 
@@ -313,7 +380,7 @@ impl ErTelemetry {
             self.exec_ok.fetch_add(1, Ordering::Relaxed);
             if let Some(dur) = duration {
                 if let Ok(mut samples) = self.exec_ms.lock() {
-                    samples.push(dur.as_millis() as u128);
+                    samples.push(dur.as_millis());
                 }
             }
         } else {
@@ -385,6 +452,10 @@ impl ErTelemetry {
         }
     }
 
+    pub fn record_parity_retry_router(&self) {
+        self.parity_retry_router.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_small_chunk_skip(&self) {
         self.small_chunk_skips.fetch_add(1, Ordering::Relaxed);
     }
@@ -425,6 +496,7 @@ impl ErTelemetry {
         let dp_end_err = self.dp_end_err.load(Ordering::Relaxed);
         let blockhash_plan_hits = self.blockhash_plan_hits.load(Ordering::Relaxed);
         let blockhash_plan_misses = self.blockhash_plan_misses.load(Ordering::Relaxed);
+        let parity_retry_router = self.parity_retry_router.load(Ordering::Relaxed);
         let last_router_error = self
             .last_router_error
             .lock()
@@ -487,6 +559,7 @@ impl ErTelemetry {
             dp_end_err,
             blockhash_plan_hits,
             blockhash_plan_misses,
+            parity_retry_router,
         }
     }
 }
@@ -689,11 +762,11 @@ fn intents_to_instructions(intents: &[UserIntent]) -> anyhow::Result<Vec<Instruc
     Ok(out)
 }
 
-fn build_and_sign_base64(
+fn build_and_sign_transaction(
     instructions: &[Instruction],
     payer: &Keypair,
     recent_blockhash: Hash,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<VersionedTransaction> {
     if instructions.is_empty() {
         bail!("cannot build transaction without instructions");
     }
@@ -702,12 +775,73 @@ fn build_and_sign_base64(
     msg.recent_blockhash = recent_blockhash;
 
     let vmsg = VersionedMessage::Legacy(msg);
-    let tx = VersionedTransaction::try_new(vmsg, &[payer])
-        .map_err(|e| anyhow::anyhow!("sign transaction: {e}"))?;
+    VersionedTransaction::try_new(vmsg, &[payer])
+        .map_err(|e| anyhow::anyhow!("sign transaction: {e}"))
+}
 
+fn encode_transaction_base64(tx: &VersionedTransaction) -> anyhow::Result<String> {
     let bytes =
-        bincode::serialize(&tx).map_err(|e| anyhow::anyhow!("serialize transaction: {e}"))?;
+        bincode::serialize(tx).map_err(|e| anyhow::anyhow!("serialize transaction: {e}"))?;
     Ok(BASE64_STANDARD.encode(bytes))
+}
+
+fn is_blockhash_not_found(error: &serde_json::Value) -> bool {
+    let check_message = |msg: &str| msg.to_ascii_lowercase().contains("blockhash not found");
+
+    // Prefer structured JSON-RPC code checks when available.
+    if let Some(code) = error.get("code").and_then(|c| c.as_i64()) {
+        if code == -32002 {
+            // Magic Router and some RPCs use -32002 for blockhash parity issues.
+            return true;
+        }
+    }
+
+    if let Some(msg) = error.get("message").and_then(|m| m.as_str()) {
+        if check_message(msg) {
+            return true;
+        }
+    }
+
+    if let Some(data_msg) = error
+        .get("data")
+        .and_then(|data| data.get("message"))
+        .and_then(|m| m.as_str())
+    {
+        if check_message(data_msg) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_blockhash_domain_error(error: &serde_json::Value) -> bool {
+    if is_blockhash_not_found(error) {
+        return true;
+    }
+
+    let mentions_blockhash = |msg: &str| {
+        let lower = msg.to_ascii_lowercase();
+        lower.contains("blockhash")
+    };
+
+    if let Some(msg) = error.get("message").and_then(|m| m.as_str()) {
+        if mentions_blockhash(msg) {
+            return true;
+        }
+    }
+
+    if let Some(data_msg) = error
+        .get("data")
+        .and_then(|data| data.get("message"))
+        .and_then(|m| m.as_str())
+    {
+        if mentions_blockhash(data_msg) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn ensure_simulation_success(sim: &serde_json::Value) -> Result<()> {
@@ -747,9 +881,12 @@ pub struct ErHttpClientInner {
     // Simple circuit breaker state for router discovery failures.
     circuit: Mutex<CircuitState>,
     data_plane_api_key: Option<HeaderValue>,
+    #[allow(dead_code)]
     blockhash_cache: Mutex<Option<BlockhashCacheEntry>>,
     telemetry: Option<Arc<ErTelemetry>>,
     wiretap: Option<Arc<dyn ErWiretap>>,
+    router_bhfa_degraded: AtomicBool,
+    #[allow(dead_code)]
     data_plane_announced: AtomicBool,
 }
 
@@ -771,6 +908,7 @@ struct CachedRoute {
     ttl: Duration,
 }
 
+#[allow(dead_code)]
 struct BlockhashCacheEntry {
     hash: Hash,
     fetched_at: Instant,
@@ -856,6 +994,7 @@ impl ErHttpClientInner {
             blockhash_cache: Mutex::new(None),
             telemetry,
             wiretap,
+            router_bhfa_degraded: AtomicBool::new(false),
             data_plane_announced: AtomicBool::new(false),
         })
     }
@@ -886,18 +1025,6 @@ impl ErHttpClientInner {
                 "using cached ER route"
             );
             return Ok(route);
-        }
-
-        // Circuit-breaker: avoid hammering router when it's repeatedly failing.
-        {
-            let mut circ = self.circuit.lock().expect("circuit poisoned");
-            if let Some(until) = circ.is_tripped() {
-                let remaining = until.saturating_duration_since(Instant::now());
-                bail!(
-                    "router circuit breaker is tripped; retry after {:?}",
-                    remaining
-                );
-            }
         }
 
         let fresh = self.fetch_route_from_router().await?;
@@ -937,15 +1064,95 @@ impl ErHttpClientInner {
         }
     }
 
+    fn should_apply_circuit(&self, url: &Url) -> bool {
+        Self::same_origin(url, &self.cfg.router_url)
+    }
+
+    fn api_key_header_for_host(&self, host: &Url) -> Result<Option<HeaderValue>> {
+        match self.cfg.privacy_mode {
+            ErPrivacyMode::Private
+                if Self::same_origin(host, &self.cfg.router_url)
+                    && self.cfg.router_api_key.is_some() =>
+            {
+                self.cfg
+                    .router_api_key
+                    .as_ref()
+                    .map(|key| HeaderValue::from_str(key).context("router api key header"))
+                    .transpose()
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn same_origin(a: &Url, b: &Url) -> bool {
+        a.scheme() == b.scheme()
+            && a.host_str() == b.host_str()
+            && a.port_or_known_default() == b.port_or_known_default()
+    }
+
+    fn decide_submit_policy(&self, hosts: &ErHosts, bhfa_from_router: bool) -> SubmitPolicy {
+        if Self::same_origin(&hosts.submit, &self.cfg.router_url) {
+            return SubmitPolicy::RouterNoPreflight;
+        }
+
+        if bhfa_from_router {
+            if let Some(override_url) = &self.cfg.endpoint_override {
+                if Self::same_origin(&hosts.submit, override_url) {
+                    return SubmitPolicy::OverrideThenRouterParityRetry;
+                }
+            }
+        }
+
+        SubmitPolicy::RpcSimulateThenSend
+    }
+
     async fn post_json(
         &self,
         url: &Url,
         body: &serde_json::Value,
         api_key_header: Option<&HeaderValue>,
     ) -> Result<JsonResponse> {
-        self.send_with_retries(url, body, api_key_header)
-            .await
-            .map_err(|e| anyhow!(e))
+        let apply_circuit = self.should_apply_circuit(url) && self.cfg.circuit_breaker_failures > 0;
+
+        if apply_circuit {
+            let mut circ = self.circuit.lock().expect("circuit poisoned");
+            if let Some(until) = circ.is_tripped() {
+                let remaining = until.saturating_duration_since(Instant::now());
+                bail!(
+                    "router circuit breaker is tripped; retry after {:?}",
+                    remaining
+                );
+            }
+        }
+
+        let result = self.send_with_retries(url, body, api_key_header).await;
+
+        if apply_circuit {
+            let mut circ = self.circuit.lock().expect("circuit poisoned");
+            match &result {
+                Ok(_) => {
+                    if circ.reset() {
+                        debug!(target: "er", "router circuit breaker reset");
+                    }
+                }
+                Err(_) => {
+                    if let Some(until) = circ.record_failure(
+                        self.cfg.circuit_breaker_failures,
+                        self.cfg.circuit_breaker_cooldown,
+                    ) {
+                        warn!(
+                            target: "er",
+                            retry_after_ms = self.cfg.circuit_breaker_cooldown.as_millis(),
+                            failures = self.cfg.circuit_breaker_failures,
+                            "router circuit breaker opened; suppressing requests until {:?}",
+                            until
+                        );
+                    }
+                }
+            }
+        }
+
+        result.map_err(|e| anyhow!(e))
     }
 
     async fn fetch_route_from_router(&self) -> Result<CachedRoute> {
@@ -972,13 +1179,6 @@ impl ErHttpClientInner {
             .post_json(&discovery_url, &body, api_key_header.as_ref())
             .await
             .with_context(|| rpc_context("getRoutes", &discovery_url, request_id))?;
-
-        {
-            let mut circ = self.circuit.lock().expect("circuit poisoned");
-            if circ.reset() {
-                debug!(target: "er", "router circuit breaker reset");
-            }
-        }
 
         if !response.status.is_success() {
             bail!("router discovery failed: {}", response.status);
@@ -1109,7 +1309,7 @@ impl ErHttpClientInner {
 
                         last_err = Some(RouterRequestError::new(
                             RouterErrorKind::Request,
-                            format!("server error {}", status),
+                            format!("server error {status}"),
                         ));
 
                         if retrying {
@@ -1141,7 +1341,7 @@ impl ErHttpClientInner {
                         if retrying {
                             last_err = Some(RouterRequestError::new(
                                 RouterErrorKind::Request,
-                                format!("json-rpc error {} ({})", code, meaning),
+                                format!("json-rpc error {code} ({meaning})"),
                             ));
                             sleep(compute_router_backoff(attempt_idx)).await;
                             continue;
@@ -1238,9 +1438,100 @@ impl ErHttpClientInner {
     }
 
     fn wiretap_dp_filename(method: &str, ts: &str, suffix: &str) -> String {
-        format!("dp-{}-{}_{}", method, ts, suffix)
+        format!("dp-{method}-{ts}_{suffix}")
     }
 
+    fn wiretap_guard(&self, label: &str, payload: serde_json::Value) {
+        if let Some(tap) = self.wiretap() {
+            let filename = format!(
+                "guard-{}-{}.json",
+                label,
+                Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+            );
+            tap.write_json(&filename, &payload);
+        }
+    }
+
+    fn wiretap_bhfa_guard(
+        &self,
+        tx: &VersionedTransaction,
+        plan: Option<&ErBlockhashPlan>,
+    ) -> Result<()> {
+        let tx_blockhash = match &tx.message {
+            VersionedMessage::Legacy(msg) => msg.recent_blockhash,
+            VersionedMessage::V0(msg) => msg.recent_blockhash,
+        };
+
+        let expected = plan.map(|p| p.blockhash.hash);
+        let status = match expected {
+            Some(expected_hash) if expected_hash == tx_blockhash => "match",
+            Some(_) => "mismatch",
+            None => "absent",
+        };
+
+        let signature_ready = !tx.signatures.is_empty()
+            && tx.signatures.iter().any(|sig| *sig != Signature::default());
+
+        let payload = serde_json::json!({
+            "tx_blockhash": tx_blockhash.to_string(),
+            "expected_blockhash": expected.map(|h| h.to_string()),
+            "status": status,
+            "signature_ready": signature_ready,
+            "signature_count": tx.signatures.len(),
+        });
+        self.wiretap_guard("bhfa-blockhash", payload);
+
+        let expected_str = expected.map(|h| h.to_string());
+        if self.cfg.wiretap_verify_blockhash {
+            ensure!(
+                matches!(status, "match"),
+                "BHFA wiretap guard mismatch: tx_blockhash={}, expected={:?}",
+                tx_blockhash,
+                expected_str
+            );
+            ensure!(
+                signature_ready,
+                "BHFA wiretap guard detected missing or default signatures"
+            );
+        } else {
+            match status {
+                "match" => {
+                    debug!(
+                        target: "er",
+                        tx_blockhash = %tx_blockhash,
+                        "BHFA wiretap guard confirmed transaction blockhash"
+                    );
+                }
+                "mismatch" => {
+                    warn!(
+                        target: "er",
+                        tx_blockhash = %tx_blockhash,
+                        expected = expected_str.as_deref().unwrap_or("<none>"),
+                        "BHFA wiretap guard detected blockhash mismatch"
+                    );
+                }
+                "absent" => {
+                    warn!(
+                        target: "er",
+                        tx_blockhash = %tx_blockhash,
+                        "BHFA wiretap guard enabled but blockhash plan absent"
+                    );
+                }
+                _ => {}
+            }
+
+            if !signature_ready {
+                warn!(
+                    target: "er",
+                    "BHFA wiretap guard detected missing or default signatures"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn announce_data_plane(&self, endpoint: &Url) {
         if !self.data_plane_announced.swap(true, Ordering::Relaxed) {
             info!(
@@ -1279,29 +1570,70 @@ impl ErHttpClientInner {
         })
     }
 
-    async fn fetch_blockhash_plan_via_bhfa(
+    async fn fetch_blockhash_for_accounts_at(
         &self,
+        host: &Url,
         accounts: &[Pubkey],
         route: &ErRouteInfo,
         route_duration: Duration,
     ) -> Result<ErBlockhashPlan> {
-        let cfg = bhfa::BhfaConfig::new(
-            self.cfg.router_url.clone(),
-            self.cfg.router_api_key.clone(),
-            self.cfg.http_timeout,
-            self.cfg.connect_timeout,
-        );
-
         let bhfa_start = Instant::now();
-        let (hash, last_valid_slot) = match bhfa::get_blockhash_for_accounts(&cfg, accounts).await {
+        let request_id = next_router_request_id();
+        let ctx = rpc_context("getBlockhashForAccounts", host, request_id);
+
+        let api_key_header = self.api_key_header_for_host(host)?;
+
+        let account_strings: Vec<String> = accounts.iter().map(|pk| pk.to_string()).collect();
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "getBlockhashForAccounts",
+            "params": {
+                "accounts": account_strings,
+            },
+        });
+
+        let response = match self.post_json(host, &body, api_key_header.as_ref()).await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if let Some(tel) = &self.telemetry {
+                    tel.record_bhfa_failure();
+                }
+                return Err(err).with_context(|| ctx.clone());
+            }
+        };
+
+        let parse_result: Result<(Hash, u64)> = (|| {
+            let payload = response.value;
+            let result = payload
+                .get("result")
+                .ok_or_else(|| anyhow!("BHFA: missing result field"))?;
+
+            let blockhash_str = result
+                .get("blockhash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("BHFA: missing blockhash"))?;
+
+            let last_valid = result
+                .get("lastValidBlockHeight")
+                .or_else(|| result.get("lastValidSlot"))
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| anyhow!("BHFA: missing lastValidBlockHeight/lastValidSlot"))?;
+
+            let hash = Hash::from_str(blockhash_str).context("BHFA: invalid blockhash format")?;
+            Ok((hash, last_valid))
+        })();
+
+        let (hash, last_valid_slot) = match parse_result {
             Ok(res) => res,
             Err(err) => {
                 if let Some(tel) = &self.telemetry {
                     tel.record_bhfa_failure();
                 }
-                return Err(err.context("bhfa request"));
+                return Err(err).with_context(|| ctx.clone());
             }
         };
+
         let bhfa_duration = bhfa_start.elapsed();
         if let Some(tel) = &self.telemetry {
             tel.record_bhfa_success(bhfa_duration);
@@ -1312,20 +1644,40 @@ impl ErHttpClientInner {
             last_valid_slot,
         };
 
+        let source = if Self::same_origin(host, &self.cfg.router_url) {
+            BlockhashSource::Router
+        } else {
+            BlockhashSource::RouteEndpoint
+        };
+
         self.convert_blockhash_plan(
             route,
             &plan,
             route_duration,
             bhfa_duration,
-            BlockhashSource::Router,
-            Some(&self.cfg.router_url),
+            source,
+            Some(host),
         )
     }
 
     async fn begin_session_router(&self, accounts: &[Pubkey]) -> Result<ErSession> {
+        let was_degraded = self.router_bhfa_degraded.swap(false, Ordering::Relaxed);
+        if was_degraded {
+            debug!(target: "er", "router BHFA probe reset for new session");
+        }
+
         let route_start = Instant::now();
         let route = self.resolve_route().await?;
         let route_duration = route_start.elapsed();
+        let hosts = self.cfg.resolve_hosts();
+
+        info!(
+            target: "er.hosts",
+            bhfa_host = hosts.bhfa.as_str(),
+            submit_host = hosts.submit.as_str(),
+            override_present = self.cfg.endpoint_override.is_some(),
+            "ER host resolution established"
+        );
 
         info!(
             target: "er",
@@ -1338,7 +1690,8 @@ impl ErHttpClientInner {
         Ok(ErSession {
             id: "router-session".to_string(),
             route: route.clone(),
-            endpoint: route.endpoint.clone(),
+            endpoint: hosts.submit.clone(),
+            hosts,
             accounts: accounts.to_vec(),
             started_at: Instant::now(),
             route_duration,
@@ -1357,50 +1710,251 @@ impl ErHttpClientInner {
         let instructions = intents_to_instructions(intents)
             .context("failed to convert intents into instructions")?;
 
-        let recent_blockhash = self
-            .get_latest_blockhash(&session.endpoint)
-            .await
-            .context("fetching latest blockhash for ER execute")?;
+        let hosts = &session.hosts;
+        let bhfa_host = &hosts.bhfa;
+        let submit_host = &hosts.submit;
 
-        let base64_tx =
-            build_and_sign_base64(&instructions, self.cfg.payer.as_ref(), recent_blockhash)
+        info!(
+            target: "er",
+            bhfa_host = bhfa_host.as_str(),
+            submit_host = submit_host.as_str(),
+            "ER execution host mapping"
+        );
+
+        let mut blockhash_plan_opt: Option<ErBlockhashPlan> = None;
+        let mut router_err: Option<anyhow::Error> = None;
+        let mut override_err: Option<anyhow::Error> = None;
+
+        let override_host = self.cfg.endpoint_override.as_ref();
+        let router_host = &self.cfg.router_url;
+        let attempt_router = self.cfg.require_router
+            || override_host.is_none()
+            || !self.router_bhfa_degraded.load(Ordering::Relaxed);
+
+        if attempt_router {
+            match self
+                .fetch_blockhash_for_accounts_at(
+                    router_host,
+                    &session.accounts,
+                    &session.route,
+                    session.route_duration,
+                )
+                .await
+            {
+                Ok(plan) => {
+                    self.router_bhfa_degraded.store(false, Ordering::Relaxed);
+                    blockhash_plan_opt = Some(plan);
+                }
+                Err(err) => {
+                    if let Some(override_host) = override_host {
+                        if self.cfg.require_router {
+                            warn!(
+                                target: "er",
+                                bhfa_host = router_host.as_str(),
+                                override_host = override_host.as_str(),
+                                "BHFA via router failed under require_router: {:#}",
+                                err
+                            );
+                        } else {
+                            let first = !self.router_bhfa_degraded.swap(true, Ordering::Relaxed);
+                            if first {
+                                warn!(
+                                    target: "er",
+                                    bhfa_host = router_host.as_str(),
+                                    fallback_host = override_host.as_str(),
+                                    "BHFA via router failed; enabling override fallback: {:#}",
+                                    err
+                                );
+                            } else {
+                                debug!(
+                                    target: "er",
+                                    bhfa_host = router_host.as_str(),
+                                    fallback_host = override_host.as_str(),
+                                    "BHFA via router still degraded: {:#}",
+                                    err
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(
+                            target: "er",
+                            bhfa_host = router_host.as_str(),
+                            "BHFA via router failed: {:#}",
+                            err
+                        );
+                    }
+                    router_err = Some(err);
+                }
+            }
+        } else if let Some(override_host) = override_host {
+            debug!(
+                target: "er",
+                bhfa_host = router_host.as_str(),
+                fallback_host = override_host.as_str(),
+                "Skipping router BHFA probe; degraded flag active"
+            );
+        }
+
+        if blockhash_plan_opt.is_none() && !self.cfg.require_router {
+            if let Some(fallback_host) = override_host {
+                match self
+                    .fetch_blockhash_for_accounts_at(
+                        fallback_host,
+                        &session.accounts,
+                        &session.route,
+                        session.route_duration,
+                    )
+                    .await
+                {
+                    Ok(plan) => {
+                        blockhash_plan_opt = Some(plan);
+                    }
+                    Err(err) => {
+                        warn!(
+                            target: "er",
+                            bhfa_host = fallback_host.as_str(),
+                            "BHFA via override host failed: {:#}",
+                            err
+                        );
+                        override_err = Some(err);
+                    }
+                }
+            }
+        }
+
+        if blockhash_plan_opt.is_none() && self.cfg.require_router {
+            if let Some(err) = router_err {
+                return Err(err).context("BHFA required but failed");
+            }
+            return Err(anyhow!("BHFA required but unavailable"));
+        }
+
+        if let Some(plan) = blockhash_plan_opt.as_ref() {
+            info!(
+                target: "er.bhfa",
+                source = plan.blockhash.source.as_str(),
+                fetched_from = plan.blockhash.fetched_from.as_str(),
+                last_valid_block_height = plan.blockhash.last_valid_block_height,
+                "BHFA plan acquired"
+            );
+        }
+
+        if blockhash_plan_opt.is_none() {
+            let mut detail_segments: Vec<String> = Vec::new();
+            if let Some(err) = router_err.as_ref() {
+                detail_segments.push(format!("router: {err:#}"));
+            }
+            if let Some(err) = override_err.as_ref() {
+                detail_segments.push(format!("override: {err:#}"));
+            }
+            let detail = if detail_segments.is_empty() {
+                "no BHFA attempt succeeded".to_string()
+            } else {
+                detail_segments.join(" | ")
+            };
+            warn!(
+                target: "er",
+                bhfa_host = bhfa_host.as_str(),
+                submit_host = submit_host.as_str(),
+                fallback_reason = "bhfa_error",
+                require_router = self.cfg.require_router,
+                "BHFA unavailable; {detail}"
+            );
+            if self.cfg.require_router {
+                return Err(anyhow!("BHFA required but failed: {detail}"));
+            }
+            return Err(anyhow!("BHFA unavailable: {detail}"));
+        }
+
+        let bhfa_plan_ref = blockhash_plan_opt
+            .as_ref()
+            .expect("blockhash plan must exist after guard");
+        let bhfa_source = bhfa_plan_ref.blockhash.source;
+        let bhfa_from_router = matches!(bhfa_source, BlockhashSource::Router);
+        let policy = self.decide_submit_policy(hosts, bhfa_from_router);
+
+        let recent_blockhash = bhfa_plan_ref.blockhash.hash;
+
+        let final_submit_host = submit_host.clone();
+        let submit_reason = match policy {
+            SubmitPolicy::RouterNoPreflight => "bhfa_source_router",
+            SubmitPolicy::OverrideThenRouterParityRetry => "router_retry_on_parity",
+            SubmitPolicy::RpcSimulateThenSend => "user_override_or_region_bhfa",
+        };
+        let run_simulation = match policy {
+            SubmitPolicy::RouterNoPreflight => false,
+            SubmitPolicy::RpcSimulateThenSend => true,
+            SubmitPolicy::OverrideThenRouterParityRetry => !self.cfg.skip_preflight_on_override,
+        };
+        let mut preflight_skipped = !run_simulation;
+
+        info!(
+            target: "er.submit",
+            host = final_submit_host.as_str(),
+            reason = submit_reason,
+            submit_policy = policy.as_str(),
+            preflight_skipped,
+            "ER submit host finalized"
+        );
+
+        let tx =
+            build_and_sign_transaction(&instructions, self.cfg.payer.as_ref(), recent_blockhash)
                 .context("building and signing ER transaction")?;
-        let api_key = self.data_plane_api_key_header();
+        self.wiretap_bhfa_guard(&tx, blockhash_plan_opt.as_ref())?;
+        let base64_tx = encode_transaction_base64(&tx)
+            .context("encoding ER transaction for router submission")?;
 
-        let sim_request_id = next_router_request_id();
-        let sim_ctx = rpc_context("simulateTransaction", &session.endpoint, sim_request_id);
-        let sim_body = serde_json::json!({
-            "jsonrpc":"2.0","id":sim_request_id,"method":"simulateTransaction",
-            "params":[ base64_tx.clone(), {
-                "encoding":"base64",
-                "replaceRecentBlockhash": false,
-                "sigVerify": true,
-                "commitment": "processed"
-            }]
-        });
-        let sim_ts = Self::wiretap_dp_timestamp();
-        let sim_req_name = Self::wiretap_dp_filename("simulateTransaction", &sim_ts, "req.json");
-        self.wiretap_write_json(&sim_req_name, &sim_body);
-        let sim = self
-            .post_json(&session.endpoint, &sim_body, api_key)
-            .await
-            .with_context(|| sim_ctx.clone())?;
-        let sim_resp_name = Self::wiretap_dp_filename("simulateTransaction", &sim_ts, "resp.txt");
-        let sim_pretty =
-            serde_json::to_string_pretty(&sim.value).unwrap_or_else(|_| sim.value.to_string());
-        self.wiretap_write_string(&sim_resp_name, &sim_pretty);
-        ensure_simulation_success(&sim.value).with_context(|| sim_ctx.clone())?;
-        if let Some(tel) = telemetry {
-            tel.record_router_usage(true, false);
+        if run_simulation {
+            let sim_request_id = next_router_request_id();
+            let sim_ctx = rpc_context("simulateTransaction", &final_submit_host, sim_request_id);
+            let sim_body = serde_json::json!({
+                "jsonrpc":"2.0","id":sim_request_id,"method":"simulateTransaction",
+                "params":[ base64_tx.clone(), {
+                    "encoding":"base64",
+                    "replaceRecentBlockhash": false,
+                    "sigVerify": true,
+                    "commitment": "processed"
+                }]
+            });
+            let sim_ts = Self::wiretap_dp_timestamp();
+            let sim_req_name =
+                Self::wiretap_dp_filename("simulateTransaction", &sim_ts, "req.json");
+            self.wiretap_write_json(&sim_req_name, &sim_body);
+            let sim_api_key = if Self::same_origin(&final_submit_host, &self.cfg.router_url) {
+                self.data_plane_api_key_header()
+            } else {
+                None
+            };
+            let sim = self
+                .post_json(&final_submit_host, &sim_body, sim_api_key)
+                .await
+                .with_context(|| sim_ctx.clone())?;
+            let sim_resp_name =
+                Self::wiretap_dp_filename("simulateTransaction", &sim_ts, "resp.txt");
+            let sim_pretty =
+                serde_json::to_string_pretty(&sim.value).unwrap_or_else(|_| sim.value.to_string());
+            self.wiretap_write_string(&sim_resp_name, &sim_pretty);
+            ensure_simulation_success(&sim.value).with_context(|| sim_ctx.clone())?;
+            if let Some(tel) = telemetry {
+                if Self::same_origin(&final_submit_host, &self.cfg.router_url) {
+                    tel.record_router_usage(true, false);
+                }
+            }
         }
 
         let send_request_id = next_router_request_id();
-        let send_ctx = rpc_context("sendTransaction", &session.endpoint, send_request_id);
+        let send_ctx = rpc_context("sendTransaction", &final_submit_host, send_request_id);
+        let mut final_send_ctx = send_ctx.clone();
+        let initial_skip_preflight = match policy {
+            SubmitPolicy::RouterNoPreflight => self.cfg.skip_preflight_on_router,
+            SubmitPolicy::RpcSimulateThenSend => true,
+            SubmitPolicy::OverrideThenRouterParityRetry => self.cfg.skip_preflight_on_override,
+        };
         let send_body = serde_json::json!({
             "jsonrpc":"2.0","id":send_request_id,"method":"sendTransaction",
-            "params":[ base64_tx, {
+            "params":[ base64_tx.clone(), {
                 "encoding":"base64",
-                "skipPreflight": true,
+                "skipPreflight": initial_skip_preflight,
                 "preflightCommitment":"processed"
             }]
         });
@@ -1408,30 +1962,129 @@ impl ErHttpClientInner {
         let send_req_name = Self::wiretap_dp_filename("sendTransaction", &send_ts, "req.json");
         self.wiretap_write_json(&send_req_name, &send_body);
         let send_start = Instant::now();
-        let send = self
-            .post_json(&session.endpoint, &send_body, api_key)
+        let submit_api_key = if Self::same_origin(&final_submit_host, &self.cfg.router_url) {
+            self.data_plane_api_key_header()
+        } else {
+            None
+        };
+        let mut send_response = self
+            .post_json(&final_submit_host, &send_body, submit_api_key)
             .await
             .with_context(|| send_ctx.clone())?;
-        let exec_duration = send_start.elapsed();
+        let mut exec_duration = send_start.elapsed();
         let send_resp_name = Self::wiretap_dp_filename("sendTransaction", &send_ts, "resp.txt");
-        let send_pretty =
-            serde_json::to_string_pretty(&send.value).unwrap_or_else(|_| send.value.to_string());
+        let send_pretty = serde_json::to_string_pretty(&send_response.value)
+            .unwrap_or_else(|_| send_response.value.to_string());
         self.wiretap_write_string(&send_resp_name, &send_pretty);
 
-        if let Some(err) = send.value.get("error") {
-            Err(anyhow!("sendTransaction RPC error: {err}")).with_context(|| send_ctx.clone())?;
+        let mut resolved_submit_host = final_submit_host.clone();
+        let parity_retry_possible = matches!(policy, SubmitPolicy::OverrideThenRouterParityRetry);
+        let mut parity_retry = false;
+
+        if parity_retry_possible {
+            if let Some(err) = send_response.value.get("error") {
+                if is_blockhash_domain_error(err) {
+                    warn!(
+                        target: "er",
+                        error_class = "host_parity",
+                        bhfa_host = bhfa_host.as_str(),
+                        submit_host = final_submit_host.as_str(),
+                        retry_host = self.cfg.router_url.as_str(),
+                        "sendTransaction returned blockhash-not-found; retrying via router"
+                    );
+                    if let Some(tel) = telemetry {
+                        tel.record_parity_retry_router();
+                    }
+                    let retry_request_id = next_router_request_id();
+                    let retry_ctx =
+                        rpc_context("sendTransaction", &self.cfg.router_url, retry_request_id);
+                    let retry_body = serde_json::json!({
+                        "jsonrpc":"2.0","id":retry_request_id,"method":"sendTransaction",
+                        "params":[ base64_tx.clone(), {
+                            "encoding":"base64",
+                            "skipPreflight": true,
+                            "preflightCommitment":"processed"
+                        }]
+                    });
+                    let retry_ts = Self::wiretap_dp_timestamp();
+                    let retry_req_name =
+                        Self::wiretap_dp_filename("sendTransaction", &retry_ts, "retry-req.json");
+                    self.wiretap_write_json(&retry_req_name, &retry_body);
+                    let router_send = self
+                        .post_json(
+                            &self.cfg.router_url,
+                            &retry_body,
+                            self.data_plane_api_key_header(),
+                        )
+                        .await
+                        .with_context(|| retry_ctx.clone())?;
+                    final_send_ctx = retry_ctx;
+                    exec_duration = send_start.elapsed();
+                    resolved_submit_host = self.cfg.router_url.clone();
+                    preflight_skipped = true;
+                    parity_retry = true;
+                    let retry_resp_name =
+                        Self::wiretap_dp_filename("sendTransaction", &retry_ts, "retry-resp.txt");
+                    let retry_pretty = serde_json::to_string_pretty(&router_send.value)
+                        .unwrap_or_else(|_| router_send.value.to_string());
+                    self.wiretap_write_string(&retry_resp_name, &retry_pretty);
+                    send_response = router_send;
+                    info!(
+                        target: "er.submit",
+                        host = resolved_submit_host.as_str(),
+                        reason = "router_retry_on_parity",
+                        submit_policy = policy.as_str(),
+                        preflight_skipped = true,
+                        parity_retry = true,
+                        "ER parity retry routed via Magic Router"
+                    );
+                }
+            }
         }
 
-        let signature = send
+        if let Some(err) = send_response.value.get("error") {
+            if self.cfg.endpoint_override.is_some() && is_blockhash_not_found(err) {
+                let fallback = !self.cfg.require_router;
+                warn!(
+                    target: "er",
+                    error_class = "host_parity",
+                    bhfa_host = bhfa_host.as_str(),
+                    submit_host = resolved_submit_host.as_str(),
+                    fallback,
+                    "sendTransaction returned blockhash-not-found under endpoint override"
+                );
+                if self.cfg.require_router {
+                    return Err(anyhow!(
+                        "sendTransaction blockhash mismatch under endpoint override"
+                    ))
+                    .with_context(|| send_ctx.clone());
+                }
+            }
+            Err(anyhow!("sendTransaction RPC error: {err}"))
+                .with_context(|| final_send_ctx.clone())?;
+        }
+
+        let signature = send_response
             .value
             .get("result")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("sendTransaction missing string result"))
-            .with_context(|| send_ctx.clone())?
+            .with_context(|| final_send_ctx.clone())?
             .to_string();
 
+        info!(
+            target: "er.submit",
+            host = resolved_submit_host.as_str(),
+            policy = policy.as_str(),
+            parity_retry,
+            sig = %signature,
+            "ER transaction submitted"
+        );
+
         if let Some(tel) = telemetry {
-            tel.record_router_usage(false, true);
+            if Self::same_origin(&resolved_submit_host, &self.cfg.router_url) {
+                tel.record_router_usage(false, true);
+            }
         }
 
         Ok(ErOutput {
@@ -1439,11 +2092,16 @@ impl ErHttpClientInner {
             settlement_accounts: Vec::new(),
             plan_fingerprint: Some(compute_plan_fingerprint(intents)),
             exec_duration,
-            blockhash_plan: None,
+            blockhash_plan: blockhash_plan_opt,
             signature: Some(signature),
+            preflight_skipped,
+            submit_policy: policy,
+            final_submit_host: resolved_submit_host,
+            parity_retry,
         })
     }
 
+    #[allow(dead_code)]
     async fn get_latest_blockhash(&self, endpoint: &Url) -> Result<Hash> {
         let request_id = next_router_request_id();
         let ctx_label = rpc_context("getLatestBlockhash", endpoint, request_id);
@@ -1490,11 +2148,11 @@ impl ErHttpClientInner {
         Hash::from_str(hash_str)
             .map_err(|e| anyhow!("blockhash parse: {e}"))
             .with_context(|| ctx_label.clone())
-            .map(|hash| {
+            .inspect(|hash| {
                 if self.cfg.blockhash_cache_ttl > Duration::ZERO {
                     if let Ok(mut guard) = self.blockhash_cache.lock() {
                         *guard = Some(BlockhashCacheEntry {
-                            hash,
+                            hash: *hash,
                             fetched_at: Instant::now(),
                         });
                     }
@@ -1502,7 +2160,6 @@ impl ErHttpClientInner {
                         tel.record_blockhash_cache(false);
                     }
                 }
-                hash
             })
     }
 }
@@ -1607,6 +2264,7 @@ struct BlockhashRpcResult {
     last_valid_block_height: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DataPlaneBeginResult {
     #[serde(rename = "sessionId")]
@@ -1615,6 +2273,7 @@ struct DataPlaneBeginResult {
     blockhash_plan: Option<DataPlaneBlockhashPlan>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 struct DataPlaneBlockhashPlan {
     blockhash: String,
@@ -1622,7 +2281,9 @@ struct DataPlaneBlockhashPlan {
     last_valid_slot: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
+#[derive(Default)]
 struct DataPlaneExecuteMetrics {
     #[serde(rename = "cuUsed")]
     cu_used: Option<u64>,
@@ -1632,16 +2293,7 @@ struct DataPlaneExecuteMetrics {
     elapsed_ms: Option<u64>,
 }
 
-impl Default for DataPlaneExecuteMetrics {
-    fn default() -> Self {
-        Self {
-            cu_used: None,
-            fee_lamports: None,
-            elapsed_ms: None,
-        }
-    }
-}
-
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DataPlaneExecuteResult {
     #[serde(rename = "settlementInstructions")]

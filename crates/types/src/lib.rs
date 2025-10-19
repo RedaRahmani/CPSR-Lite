@@ -5,12 +5,7 @@ pub mod merkle;
 pub mod serde;
 pub mod version;
 
-pub use bundle::*;
-pub use hash::*;
-pub use intent::*;
-pub use merkle::*;
-pub use serde::*;
-pub use version::*;
+// Re-export selected public items explicitly below to avoid unused glob warnings under clippy -D warnings.
 
 pub use crate::bundle::{Bundle, Chunk};
 pub use crate::hash::{blake3_concat, blake3_hash, dhash, Hash32, ZERO32};

@@ -68,6 +68,10 @@ mod tests {
             blockhash_cache_ttl: Duration::from_millis(0),
             min_cu_threshold: 0,
             merge_small_intents: false,
+            require_router: false,
+            wiretap_verify_blockhash: false,
+                skip_preflight_on_router: false,
+                skip_preflight_on_override: false,
             telemetry: None,
             wiretap: None,
         }

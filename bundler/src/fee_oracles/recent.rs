@@ -65,11 +65,7 @@ impl RecentFeesOracle {
             Ok(list) if !list.is_empty() => {
                 RPC_GET_RECENT_FEES_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
                 list.into_iter()
-                    .map(
-                        |RpcPrioritizationFee {
-                             prioritization_fee, ..
-                         }| prioritization_fee as u64,
-                    )
+                    .map(|RpcPrioritizationFee { prioritization_fee, .. }| prioritization_fee)
                     .collect()
             }
             _ => vec![],
@@ -165,7 +161,7 @@ mod tests {
 
     #[test]
     fn percentile_indexing_is_conservative() {
-        let o = RecentFeesOracle::new(Arc::new(RpcClient::new_mock("")), vec![]);
+    let _o = RecentFeesOracle::new(Arc::new(RpcClient::new_mock("")), vec![]);
         let mut d = vec![1u64, 2, 3, 10, 20, 100];
         d.sort_unstable();
         assert_eq!(RecentFeesOracle::pct(&d, 0.75).unwrap(), 20);
