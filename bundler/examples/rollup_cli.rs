@@ -729,11 +729,11 @@ struct Args {
     er_retries: usize,
 
     /// ER HTTP request timeout (ms)
-    #[arg(long, default_value_t = 3_000)]
+    #[arg(long, default_value_t = 5_000)]
     er_http_timeout_ms: u64,
 
     /// ER HTTP connect timeout (ms)
-    #[arg(long, default_value_t = 1_000)]
+    #[arg(long, default_value_t = 3_000)]
     er_connect_timeout_ms: u64,
 
     /// Router circuit breaker failure threshold
@@ -760,6 +760,18 @@ struct Args {
     /// No longer enforced in this CLI since ER doesn't require beginSession.
     #[arg(long, default_value_t = false)]
     er_require: bool,
+
+    /// When set, emit an extra wiretap guard affirming BHFA blockhash in signed tx (debug aid).
+    #[arg(long, default_value_t = false)]
+    er_wiretap_verify_bhfa: bool,
+
+    /// Skip Solana preflight when submitting via the Magic Router.
+    #[arg(long, default_value_t = true)]
+    er_skip_preflight_on_router: bool,
+
+    /// Skip Solana preflight when submitting via the override RPC, if configured.
+    #[arg(long, default_value_t = false)]
+    er_skip_preflight_on_override: bool,
 
     /// Directory to dump ER wiretap (requests/responses) for diagnostics
     #[arg(long)]
@@ -919,8 +931,15 @@ struct ErChunkSummaryRow {
     decision: String,
     reason: Option<String>,
     route: Option<String>,
+    bhfa_host: Option<String>,
+    submit_host: Option<String>,
+    submit_policy: Option<String>,
+    preflight_skipped: Option<bool>,
+    parity_retry: Option<bool>,
     total_ms: u128,
     exec_ms: Option<u128>,
+    orchestration_ms: Option<u128>,
+    bhfa_ms: Option<u128>,
     used_cu: u32,
     er_attempted: bool,
     session_established: bool,
@@ -1200,6 +1219,10 @@ impl SharedSetup {
                 blockhash_cache_ttl: Duration::from_millis(args.er_blockhash_ttl_ms),
                 min_cu_threshold: args.er_min_cu_threshold,
                 merge_small_intents: args.er_merge_small_intents,
+                require_router: args.er_require,
+                wiretap_verify_blockhash: args.er_wiretap_verify_bhfa,
+                skip_preflight_on_router: args.er_skip_preflight_on_router,
+                skip_preflight_on_override: args.er_skip_preflight_on_override,
                 telemetry: Some(telemetry.clone()),
                 wiretap: if wiretap.enabled() {
                     Some(Arc::new(wiretap.clone()) as Arc<dyn ErWiretap>)
@@ -1236,6 +1259,9 @@ impl SharedSetup {
                     .unwrap_or("<none>"),
                 api_key_state = api_key_state,
                 er_require = args.er_require,
+                er_skip_preflight_on_router = args.er_skip_preflight_on_router,
+                er_skip_preflight_on_override = args.er_skip_preflight_on_override,
+                er_wiretap_verify_bhfa = args.er_wiretap_verify_bhfa,
                 "ER feature gate summary"
             );
 
@@ -1301,6 +1327,7 @@ impl SharedSetup {
                     telemetry.clone(),
                     enabled,
                     args.dry_run,
+                    cfg.require_router,
                     cfg.min_cu_threshold,
                     cfg.merge_small_intents,
                 )),
@@ -1644,6 +1671,7 @@ async fn run_er_once(args: &Args, setup: &mut SharedSetup) -> Result<(ErRunResul
 
             match chunk.outcome {
                 bundler::pipeline::rollup::ChunkOutcome::Success(success) => {
+                    let success = *success;
                     layer_success += 1;
                     simulate_durations.push(success.report.simulate_duration);
                     if let Some(send_dur) = success.report.send_duration {
@@ -1747,8 +1775,17 @@ async fn run_er_once(args: &Args, setup: &mut SharedSetup) -> Result<(ErRunResul
                         decision: decision.to_string(),
                         reason: fallback_reason.clone(),
                         route: chunk_er_diag.route_endpoint.clone(),
+                        bhfa_host: success.er_bhfa_host.clone(),
+                        submit_host: success.er_submit_host.clone(),
+                        submit_policy: success
+                            .er_submit_policy
+                            .map(|policy| policy.as_str().to_string()),
+                        preflight_skipped: success.er_preflight_skipped,
+                        parity_retry: success.er_parity_retry,
                         total_ms: chunk_timings.total.as_millis(),
                         exec_ms: er_execution_ms_opt,
+                        orchestration_ms: success.er_orchestration_ms,
+                        bhfa_ms: success.er_bhfa_ms,
                         used_cu: success.report.used_cu,
                         er_attempted: chunk_er_diag.attempted,
                         session_established: chunk_er_diag.session_established,
@@ -2279,20 +2316,50 @@ fn print_er_chunk_summary(rows: &[ErChunkSummaryRow]) {
     }
     println!("\n=== ER CHUNK SUMMARY ===");
     println!(
-        "{:<5} {:<6} {:<16} {:<28} {:<40} {:>12} {:>16}",
-        "Layer", "Chunk", "Decision", "Reason", "Route", "Total (ms)", "ER execute (ms)"
+        "{:<5} {:<6} {:<16} {:<20} {:<24} {:<24} {:<20} {:<10} {:<8} {:>12} {:>12} {:>12} {:>12}",
+        "Layer",
+        "Chunk",
+        "Decision",
+        "Reason",
+        "BHFA Host",
+        "Submit Host",
+        "Policy",
+        "Preflight",
+        "Parity",
+        "Total (ms)",
+        "Exec (ms)",
+        "Orch (ms)",
+        "BHFA (ms)"
     );
     for row in rows {
         let decision = truncate_cell(&row.decision, 16);
-        let reason = truncate_cell(row.reason.as_deref().unwrap_or("-"), 28);
-        let route = truncate_cell(row.route.as_deref().unwrap_or("-"), 40);
+        let reason = truncate_cell(row.reason.as_deref().unwrap_or("-"), 20);
+        let bhfa_host = truncate_cell(row.bhfa_host.as_deref().unwrap_or("-"), 24);
+        let submit_host = truncate_cell(row.submit_host.as_deref().unwrap_or("-"), 24);
+        let policy = truncate_cell(row.submit_policy.as_deref().unwrap_or("-"), 20);
+        let preflight = fmt_opt_bool(row.preflight_skipped);
+        let parity = fmt_opt_bool(row.parity_retry);
         let exec_cell = row
             .exec_ms
             .map(|ms| ms.to_string())
             .unwrap_or_else(|| "-".to_string());
+        let orch_cell = fmt_opt_u128(row.orchestration_ms);
+        let bhfa_cell = fmt_opt_u128(row.bhfa_ms);
         println!(
-            "{:<5} {:<6} {:<16} {:<28} {:<40} {:>12} {:>16}",
-            row.layer, row.chunk, decision, reason, route, row.total_ms, exec_cell
+            "{:<5} {:<6} {:<16} {:<20} {:<24} {:<24} {:<20} {:<10} {:<8} {:>12} {:>12} {:>12} {:>12}",
+            row.layer,
+            row.chunk,
+            decision,
+            reason,
+            bhfa_host,
+            submit_host,
+            policy,
+            preflight,
+            parity,
+            row.total_ms,
+            exec_cell,
+            orch_cell,
+            bhfa_cell
         );
     }
 }
@@ -2373,6 +2440,10 @@ fn print_er_blockhash_summary(summary: Option<&bundler::er::ErTelemetrySummary>)
         println!(
             "router blockhash plan miss : {}",
             summary.blockhash_plan_misses
+        );
+        println!(
+            "parity_retry_router       : {}",
+            summary.parity_retry_router
         );
         println!(
             "bhfa latency p50/p95 (ms)  : {}/{}",
@@ -2466,6 +2537,7 @@ fn er_telemetry_json(summary: &bundler::er::ErTelemetrySummary) -> serde_json::V
         "dp_end_err": summary.dp_end_err,
         "blockhash_plan_hits": summary.blockhash_plan_hits,
         "blockhash_plan_misses": summary.blockhash_plan_misses,
+        "parity_retry_router": summary.parity_retry_router,
     })
 }
 
@@ -3014,6 +3086,21 @@ fn duration_to_ms(value: Option<Duration>) -> Option<f64> {
 fn fmt_opt_f64(value: Option<f64>) -> String {
     match value {
         Some(v) => format!("{:.2}", v),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_opt_u128(value: Option<u128>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_opt_bool(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "true".to_string(),
+        Some(false) => "false".to_string(),
         None => "-".to_string(),
     }
 }

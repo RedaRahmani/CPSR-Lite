@@ -183,16 +183,16 @@ impl Dag {
     pub fn topo_order(&self) -> Result<Vec<NodeId>, DagError> {
         let n = self.nodes.len();
         let mut indeg = vec![0u32; n];
-        for v in 0..n {
-            for &_ in &self.rev_edges[v] {
+        for (v, revs) in self.rev_edges.iter().enumerate().take(n) {
+            for &_ in revs {
                 indeg[v] = indeg[v].saturating_add(1);
             }
         }
 
         // Use a stable queue seeded by increasing node index to keep determinism
         let mut q: VecDeque<NodeId> = VecDeque::new();
-        for v in 0..n {
-            if indeg[v] == 0 {
+        for (v, &deg) in indeg.iter().enumerate().take(n) {
+            if deg == 0 {
                 q.push_back(v as NodeId);
             }
         }
@@ -220,16 +220,16 @@ impl Dag {
     pub fn layers(&self) -> Result<Vec<Vec<NodeId>>, DagError> {
         let n = self.nodes.len();
         let mut indeg = vec![0u32; n];
-        for v in 0..n {
-            for &_ in &self.rev_edges[v] {
+        for (v, revs) in self.rev_edges.iter().enumerate().take(n) {
+            for &_ in revs {
                 indeg[v] = indeg[v].saturating_add(1);
             }
         }
         let mut layers: Vec<Vec<NodeId>> = Vec::new();
         let mut frontier: BTreeSet<NodeId> = BTreeSet::new(); // BTreeSet for deterministic within-layer ordering
 
-        for v in 0..n {
-            if indeg[v] == 0 {
+        for (v, &deg) in indeg.iter().enumerate().take(n) {
+            if deg == 0 {
                 frontier.insert(v as NodeId);
             }
         }

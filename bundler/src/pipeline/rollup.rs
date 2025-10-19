@@ -19,7 +19,7 @@ use crate::{
     alt::{AltManager, AltResolution},
     er::{
         classify_router_error, compute_plan_fingerprint, BlockhashSource, ErBlockhashPlan,
-        ErClient, ErOutput, ErTelemetry,
+        ErClient, ErOutput, ErTelemetry, SubmitPolicy,
     },
     fee::FeePlan,
     occ::{
@@ -107,6 +107,7 @@ fn merge_small_chunk_plans(
         let mut combined_alt_ro = head.estimates.alt_ro_count;
         let mut combined_alt_wr = head.estimates.alt_wr_count;
         let mut merged_indices: Vec<usize> = Vec::new();
+        let mut limit_reason = "fee_policy";
 
         if combined_cu < min_cu_threshold && combined_msg <= ER_SMALL_MESSAGE_BYTES {
             if let Some(actor) = head.intents.first().map(|intent| intent.actor) {
@@ -120,21 +121,26 @@ fn merge_small_chunk_plans(
                     if candidate.estimates.est_cu >= min_cu_threshold
                         || candidate.estimates.est_msg_bytes > ER_SMALL_MESSAGE_BYTES
                     {
+                        limit_reason = "fee_policy";
                         break;
                     }
                     if candidate.intents.first().map(|intent| intent.actor) != Some(actor) {
+                        limit_reason = "fee_policy";
                         break;
                     }
                     if !can_merge_intents(&mut access_map, &candidate.intents) {
+                        limit_reason = "fee_policy";
                         break;
                     }
 
                     let new_cu = combined_cu + candidate.estimates.est_cu;
                     if new_cu > max_cu {
+                        limit_reason = "size_limit";
                         break;
                     }
                     let new_msg = combined_msg + candidate.estimates.est_msg_bytes;
                     if new_msg > max_message_bytes {
+                        limit_reason = "size_limit";
                         break;
                     }
 
@@ -148,6 +154,20 @@ fn merge_small_chunk_plans(
                 }
 
                 if !merged_indices.is_empty() {
+                    let merge_reason = if combined_cu >= min_cu_threshold {
+                        "below_threshold"
+                    } else {
+                        limit_reason
+                    };
+                    info!(
+                        target: "er.merge",
+                        layer_index,
+                        head_chunk_index = head.index,
+                        merged_small_intents = merged_indices.len() + 1,
+                        reason = merge_reason,
+                        merged_used_cu = combined_cu,
+                        merged_message_bytes = combined_msg
+                    );
                     trace!(
                         target: "er.merge",
                         layer_index,
@@ -237,6 +257,7 @@ pub struct ErExecutionCtx {
     client: Arc<dyn ErClient>,
     telemetry: Arc<ErTelemetry>,
     simulate_on_failure: bool,
+    require_router: bool,
     min_cu_threshold: u64,
     merge_small_intents: bool,
 }
@@ -247,17 +268,39 @@ struct ErChunkMeta {
     blockhash_plan: Option<ErBlockhashPlan>,
     settlement_accounts: Vec<Pubkey>,
     execution_duration: Option<Duration>,
+    orchestration_ms: Option<u128>,
+    bhfa_ms: Option<u128>,
     simulated: bool,
     route_endpoint: Option<String>,
     route_cache_hit: Option<bool>,
     session_id: Option<String>,
     fallback_reason: Option<String>,
     signature: Option<String>,
+    preflight_skipped: Option<bool>,
+    submit_policy: Option<SubmitPolicy>,
+    submit_host: Option<String>,
+    bhfa_host: Option<String>,
+    parity_retry: Option<bool>,
 }
 
+/// Notes on ER submission metadata:
+/// - submit_policy: how the final host was chosen. When an override endpoint is provided and
+///   BHFA was sourced from the Router, policy resolves to override_then_router_parity_retry,
+///   enabling a fast path to the override and a safety retry via the Router if the override
+///   returns a blockhash parity error (-32002 / "blockhash not found").
+/// - preflight_skipped: true when we rely on upstream preflight (Router path) or when parity
+///   retry is engaged; false when a local simulateTransaction preflight was performed.
+/// - bhfa_host/submit_host: capture the actual origins to aid host parity investigations.
+/// - parity_retry: true when the Router retry path was used after an override parity failure.
 pub(crate) struct ErPreparedChunk {
     intents: Vec<UserIntent>,
     meta: ErChunkMeta,
+}
+
+struct PreparedChunkState {
+    intents: Vec<UserIntent>,
+    er_meta: Option<ErChunkMeta>,
+    er_diag: ErChunkDiagnostics,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -279,6 +322,7 @@ impl ErExecutionCtx {
         telemetry: Arc<ErTelemetry>,
         enabled: bool,
         simulate_on_failure: bool,
+        require_router: bool,
         min_cu_threshold: u64,
         merge_small_intents: bool,
     ) -> Self {
@@ -287,6 +331,7 @@ impl ErExecutionCtx {
             client,
             telemetry,
             simulate_on_failure,
+            require_router,
             min_cu_threshold,
             merge_small_intents,
         }
@@ -294,6 +339,10 @@ impl ErExecutionCtx {
 
     pub fn telemetry(&self) -> Arc<ErTelemetry> {
         Arc::clone(&self.telemetry)
+    }
+
+    pub fn require_router(&self) -> bool {
+        self.require_router
     }
 
     pub fn min_cu_threshold(&self) -> u64 {
@@ -323,6 +372,7 @@ impl ErExecutionCtx {
         payer: Pubkey,
         intents: &[UserIntent],
     ) -> Result<ErPreparedChunk> {
+        let total_start = Instant::now();
         if intents.is_empty() {
             return Err(anyhow!("no intents to execute via ER"));
         }
@@ -410,7 +460,7 @@ impl ErExecutionCtx {
                         chunk_index,
                         "ER simulation fallback (begin_session failed)"
                     );
-                    let reason = format!("begin_session failed: {:#}", err);
+                    let reason = format!("begin_session failed: {err:#}");
                     return Ok(self.simulate_chunk(payer, intents, Some(reason)));
                 }
                 return Err(err);
@@ -468,7 +518,7 @@ impl ErExecutionCtx {
                         chunk_index,
                         "ER simulation fallback (execute failed)"
                     );
-                    let reason = format!("execute failed: {:#}", err);
+                    let reason = format!("execute failed: {err:#}");
                     return Ok(self.simulate_chunk(payer, intents, Some(reason)));
                 }
                 return Err(err);
@@ -492,6 +542,10 @@ impl ErExecutionCtx {
             exec_duration,
             blockhash_plan,
             signature,
+            preflight_skipped,
+            submit_policy,
+            final_submit_host,
+            parity_retry,
         } = output;
 
         let settlement_accounts = if settlement_accounts.is_empty() {
@@ -515,11 +569,28 @@ impl ErExecutionCtx {
             let err = anyhow!("ER returned zero settlement instructions");
             warn!(target: "er", chunk_index, "{:#}", err);
             if self.simulate_on_failure {
-                let reason = format!("execute produced no settlement instructions: {:#}", err);
+                let reason = format!(
+                    "execute produced no settlement instructions: {err:#}"
+                );
                 return Ok(self.simulate_chunk(payer, intents, Some(reason)));
             }
             return Err(err);
         }
+
+        let total_duration = total_start.elapsed();
+        let orchestration_duration = total_duration
+            .checked_sub(exec_duration)
+            .unwrap_or(Duration::ZERO);
+        let bhfa_ms = settlement_blockhash
+            .as_ref()
+            .map(|plan| plan.blockhash_duration.as_millis());
+        let bhfa_host = settlement_blockhash
+            .as_ref()
+            .map(|plan| plan.blockhash.fetched_from.as_str().to_string());
+        let bhfa_ok = settlement_blockhash.is_some();
+        let bhfa_host_log = bhfa_host
+            .as_deref()
+            .unwrap_or_else(|| session.hosts.bhfa.as_str());
 
         info!(
             target: "er",
@@ -527,7 +598,17 @@ impl ErExecutionCtx {
             session_id = session.id.as_str(),
             settlement_ixs = settlement_intents.len(),
             settlement_accounts = settlement_accounts.len(),
+            total_ms = total_duration.as_millis(),
             exec_ms = exec_duration.as_millis(),
+            orchestration_ms = orchestration_duration.as_millis(),
+            bhfa_ms = bhfa_ms,
+            bhfa_ok = bhfa_ok,
+            bhfa_err = !bhfa_ok,
+            bhfa_host = bhfa_host_log,
+            submit_host = final_submit_host.as_str(),
+            submit_policy = submit_policy.as_str(),
+            preflight_skipped,
+            parity_retry,
             "ER execution produced settlement instructions"
         );
 
@@ -538,12 +619,19 @@ impl ErExecutionCtx {
                 blockhash_plan: settlement_blockhash,
                 settlement_accounts,
                 execution_duration: Some(exec_duration),
+                orchestration_ms: Some(orchestration_duration.as_millis()),
+                bhfa_ms,
                 simulated: false,
                 route_endpoint: Some(session.endpoint.as_str().to_string()),
                 route_cache_hit: Some(session.route.cache_hit),
                 session_id: Some(session.id.clone()),
                 fallback_reason: None,
                 signature,
+                preflight_skipped: Some(preflight_skipped),
+                submit_policy: Some(submit_policy),
+                submit_host: Some(final_submit_host.as_str().to_string()),
+                bhfa_host,
+                parity_retry: Some(parity_retry),
             },
         })
     }
@@ -567,12 +655,19 @@ impl ErExecutionCtx {
                 blockhash_plan: None,
                 settlement_accounts: Vec::new(),
                 execution_duration: None,
+                orchestration_ms: None,
+                bhfa_ms: None,
                 simulated: true,
                 route_endpoint: None,
                 route_cache_hit: None,
                 session_id: None,
                 fallback_reason: reason,
                 signature: None,
+                preflight_skipped: None,
+                submit_policy: None,
+                submit_host: None,
+                bhfa_host: None,
+                parity_retry: None,
             },
         }
     }
@@ -669,7 +764,14 @@ pub struct ChunkSuccessData {
     pub er_blockhash_plan: Option<ErBlockhashPlan>,
     pub er_simulated: bool,
     pub er_execution_duration: Option<Duration>,
+    pub er_orchestration_ms: Option<u128>,
+    pub er_bhfa_ms: Option<u128>,
     pub er_signature: Option<String>,
+    pub er_preflight_skipped: Option<bool>,
+    pub er_submit_policy: Option<SubmitPolicy>,
+    pub er_submit_host: Option<String>,
+    pub er_bhfa_host: Option<String>,
+    pub er_parity_retry: Option<bool>,
 }
 
 /// Final per-chunk outcome.
@@ -685,7 +787,7 @@ pub struct ChunkResult {
 }
 
 pub enum ChunkOutcome {
-    Success(ChunkSuccessData),
+    Success(Box<ChunkSuccessData>),
     Failed {
         error: anyhow::Error,
         retriable: bool,
@@ -756,15 +858,10 @@ where
         let deps_cloned = deps.clone();
         let cfg_cloned = cfg.clone();
         let sem_cloned = semaphore.clone();
-        let handle = tokio::spawn(async move {
-            let permit = sem_cloned
-                .acquire_owned()
-                .await
-                .expect("layer semaphore closed");
-            let result = process_chunk(plan, deps_cloned, cfg_cloned).await;
-            drop(permit);
-            result
-        });
+        let handle =
+            tokio::spawn(
+                async move { process_chunk(plan, deps_cloned, cfg_cloned, sem_cloned).await },
+            );
         handles.push((idx, handle));
     }
 
@@ -809,6 +906,7 @@ async fn process_chunk<S, F>(
     plan: ChunkPlan,
     deps: ParallelLayerDeps<S, F>,
     cfg: ParallelLayerConfig,
+    semaphore: Arc<Semaphore>,
 ) -> ChunkResult
 where
     S: Signer + Send + Sync + 'static,
@@ -827,7 +925,25 @@ where
             "parallel chunk attempt started"
         );
 
-        match process_chunk_once(&plan, &deps, &cfg).await {
+        let total_start = Instant::now();
+        let prepared = prepare_er_stage(&plan, &deps, total_start).await;
+
+        let result = match prepared {
+            Ok(prepared_state) => {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("layer semaphore closed");
+                let outcome =
+                    process_chunk_once(&plan, &deps, &cfg, total_start, prepared_state).await;
+                drop(permit);
+                outcome
+            }
+            Err(err) => Err(err),
+        };
+
+        match result {
             Ok(success) => {
                 // (nice) expose a sample of ALT tables used for observability
                 if !success.data.alt_resolution.tables.is_empty() {
@@ -842,22 +958,27 @@ where
                     debug!(target: "pipeline", chunk_index = plan.index, alt_tables = ?sample, "alt tables used (sample)");
                 }
 
+                let total_ms = success.timings.total.as_millis();
+                let send_ms_val = success
+                    .data
+                    .report
+                    .send_duration
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let orchestration_ms = total_ms.saturating_sub(send_ms_val);
+
                 info!(
                     target: "pipeline",
                     chunk_index = plan.index,
                     attempt,
-                    total_ms = success.timings.total.as_millis(),
+                    total_ms,
                     simulate_ms = success
                         .data
                         .report
                         .simulate_duration
                         .as_millis(),
-                    send_ms = success
-                        .data
-                        .report
-                        .send_duration
-                        .map(|d| d.as_millis())
-                        .unwrap_or(0),
+                    send_ms = send_ms_val,
+                    orchestration_ms,
                     er_route_ms = success
                         .data
                         .er_blockhash_plan
@@ -912,21 +1033,19 @@ where
     }
 }
 
-async fn process_chunk_once<S, F>(
+async fn prepare_er_stage<S, F>(
     plan: &ChunkPlan,
     deps: &ParallelLayerDeps<S, F>,
-    cfg: &ParallelLayerConfig,
-) -> Result<ChunkSuccess, ChunkAttemptError>
+    total_start: Instant,
+) -> Result<PreparedChunkState, ChunkAttemptError>
 where
     S: Signer + Send + Sync + 'static,
     F: AccountFetcher + Send + Sync + 'static,
 {
-    let total_start = Instant::now();
     let payer_pubkey = deps.payer.pubkey();
-
     let mut prepared_intents = plan.intents.clone();
     let mut er_meta: Option<ErChunkMeta> = None;
-    let er_telemetry = deps.er.as_ref().map(|ctx| ctx.telemetry());
+
     let mut er_diag = ErChunkDiagnostics {
         er_ctx_present: deps.er.is_some(),
         er_enabled: deps
@@ -937,13 +1056,17 @@ where
         ..ErChunkDiagnostics::default()
     };
 
-    if let Some(er_ctx) = &deps.er {
+    let er_ctx_opt = deps.er.as_ref();
+    let er_telemetry = er_ctx_opt.map(|ctx| ctx.telemetry());
+
+    if let Some(er_ctx) = er_ctx_opt {
         er_diag.er_ctx_present = true;
         er_diag.er_enabled = er_ctx.is_enabled();
         if er_ctx.is_enabled() {
             let threshold = er_ctx.min_cu_threshold();
             let below_cu = threshold > 0 && plan.estimates.est_cu < threshold;
             let small_message = plan.estimates.est_msg_bytes <= ER_SMALL_MESSAGE_BYTES;
+
             if below_cu || small_message {
                 let reason = if below_cu && small_message {
                     "below_threshold+small_message"
@@ -956,61 +1079,114 @@ where
                 if let Some(telemetry) = er_telemetry.as_ref() {
                     telemetry.record_small_chunk_skip();
                 }
-            } else {
-                er_diag.attempted = true;
-                if let Some(telemetry) = er_telemetry.as_ref() {
-                    if !plan.merged_indices.is_empty() {
-                        telemetry.record_small_chunk_merge(plan.merged_indices.len() as u64);
-                    }
+                return Ok(PreparedChunkState {
+                    intents: prepared_intents,
+                    er_meta,
+                    er_diag,
+                });
+            }
+
+            er_diag.attempted = true;
+            if let Some(telemetry) = er_telemetry.as_ref() {
+                if !plan.merged_indices.is_empty() {
+                    telemetry.record_small_chunk_merge(plan.merged_indices.len() as u64);
                 }
-                match er_ctx
-                    .prepare_chunk(plan.index, payer_pubkey, &plan.intents)
-                    .await
-                {
-                    Ok(prepared) => {
-                        let ErPreparedChunk {
-                            intents: new_intents,
-                            meta,
-                        } = prepared;
-                        if meta.simulated {
-                            warn!(
-                                target: "er",
-                                chunk_index = plan.index,
-                                "ER session simulated (dry-run)"
-                            );
-                        }
-                        er_meta = Some(meta);
-                        er_diag.simulated = er_meta.as_ref().map(|m| m.simulated).unwrap_or(false);
-                        if let Some(meta) = er_meta.as_ref() {
-                            er_diag.session_established = !meta.simulated;
-                            er_diag.route_endpoint = meta.route_endpoint.clone();
-                            er_diag.route_cache_hit = meta.route_cache_hit;
-                            er_diag.session_id = meta.session_id.clone();
-                            if let Some(reason) = meta.fallback_reason.clone() {
-                                er_diag.fallback_reason = Some(reason);
-                            }
-                        }
-                        prepared_intents = new_intents;
+            }
+
+            match er_ctx
+                .prepare_chunk(plan.index, payer_pubkey, &plan.intents)
+                .await
+            {
+                Ok(prepared) => {
+                    let ErPreparedChunk {
+                        intents: new_intents,
+                        meta,
+                    } = prepared;
+                    if meta.simulated {
+                        warn!(
+                            target: "er",
+                            chunk_index = plan.index,
+                            "ER session simulated (dry-run)"
+                        );
                     }
-                    Err(err) => {
-                        if is_phase1_disabled_error(&err) {
-                            log_phase1_fallback_once();
-                        } else {
-                            warn!(
-                                target: "er",
-                                chunk_index = plan.index,
-                                "ER fallback engaged: {:#}",
-                                err
-                            );
-                        }
-                        er_diag.fallback_reason = Some(format!("{:#}", err));
+                    er_diag.simulated = meta.simulated;
+                    er_diag.session_established = !meta.simulated;
+                    er_diag.route_endpoint = meta.route_endpoint.clone();
+                    er_diag.route_cache_hit = meta.route_cache_hit;
+                    er_diag.session_id = meta.session_id.clone();
+                    if let Some(reason) = meta.fallback_reason.clone() {
+                        er_diag.fallback_reason = Some(reason);
                     }
+                    prepared_intents = new_intents;
+                    er_meta = Some(meta);
+                }
+                Err(err) => {
+                    if is_phase1_disabled_error(&err) {
+                        log_phase1_fallback_once();
+                    } else if let Some(kind) = classify_router_error(&err) {
+                        warn!(
+                            target: "er",
+                            chunk_index = plan.index,
+                            error_class = kind.as_str(),
+                            fallback = !er_ctx.require_router(),
+                            "ER fallback engaged: {:#}",
+                            err
+                        );
+                    } else {
+                        warn!(
+                            target: "er",
+                            chunk_index = plan.index,
+                            fallback = !er_ctx.require_router(),
+                            "ER fallback engaged: {:#}",
+                            err
+                        );
+                    }
+
+                    if er_ctx.require_router() {
+                        return Err(ChunkAttemptError {
+                            stage: AttemptStage::Send,
+                            retriable: false,
+                            error: err.context("ER required but prepare_chunk failed"),
+                            timings: ChunkTimings {
+                                total: total_start.elapsed(),
+                                occ: None,
+                                alt: None,
+                            },
+                            er_diag,
+                        });
+                    }
+
+                    er_diag.fallback_reason = Some(format!("{err:#}"));
                 }
             }
         } else if er_diag.fallback_reason.is_none() {
             er_diag.fallback_reason = Some("er_disabled".to_string());
         }
     }
+
+    Ok(PreparedChunkState {
+        intents: prepared_intents,
+        er_meta,
+        er_diag,
+    })
+}
+
+async fn process_chunk_once<S, F>(
+    _plan: &ChunkPlan,
+    deps: &ParallelLayerDeps<S, F>,
+    cfg: &ParallelLayerConfig,
+    total_start: Instant,
+    prepared: PreparedChunkState,
+) -> Result<ChunkSuccess, ChunkAttemptError>
+where
+    S: Signer + Send + Sync + 'static,
+    F: AccountFetcher + Send + Sync + 'static,
+{
+    let payer_pubkey = deps.payer.pubkey();
+
+    let prepared_intents = prepared.intents;
+    let er_meta = prepared.er_meta;
+    let er_diag = prepared.er_diag;
 
     let intents_arc = Arc::new(prepared_intents);
     let occ_fetcher = deps.occ_fetcher.clone();
@@ -1147,7 +1323,14 @@ where
                     er_blockhash_plan: er_meta.as_ref().and_then(|m| m.blockhash_plan.clone()),
                     er_simulated: er_meta.as_ref().map(|m| m.simulated).unwrap_or(false),
                     er_execution_duration: er_meta.as_ref().and_then(|m| m.execution_duration),
+                    er_orchestration_ms: er_meta.as_ref().and_then(|m| m.orchestration_ms),
+                    er_bhfa_ms: er_meta.as_ref().and_then(|m| m.bhfa_ms),
                     er_signature: er_meta.as_ref().and_then(|m| m.signature.clone()),
+                    er_preflight_skipped: er_meta.as_ref().and_then(|m| m.preflight_skipped),
+                    er_submit_policy: er_meta.as_ref().and_then(|m| m.submit_policy),
+                    er_submit_host: er_meta.as_ref().and_then(|m| m.submit_host.clone()),
+                    er_bhfa_host: er_meta.as_ref().and_then(|m| m.bhfa_host.clone()),
+                    er_parity_retry: er_meta.as_ref().and_then(|m| m.parity_retry),
                 },
                 timings: ChunkTimings {
                     total: total_start.elapsed(),
@@ -1158,11 +1341,9 @@ where
             })
         }
         Err(err) => {
-            if is_stale_blockhash_error(&err) {
-                if matches!(lease_origin, LeaseOrigin::Baseline) {
-                    deps.blockhash_provider
-                        .record_outcome(&lease, LeaseOutcome::StaleDetected);
-                }
+            if is_stale_blockhash_error(&err) && matches!(lease_origin, LeaseOrigin::Baseline) {
+                deps.blockhash_provider
+                    .record_outcome(&lease, LeaseOutcome::StaleDetected);
             }
             Err(ChunkAttemptError {
                 stage: AttemptStage::Send,
@@ -1186,7 +1367,7 @@ fn chunk_success_result(plan: ChunkPlan, attempts: u32, success: ChunkSuccess) -
         occ_accounts: success.data.occ_snapshot.versions.len(),
         alt_tables: success.data.alt_resolution.tables.len(),
         timings: success.timings,
-        outcome: ChunkOutcome::Success(success.data),
+    outcome: ChunkOutcome::Success(Box::new(success.data)),
         estimates: plan.estimates,
         er: success.er_diag,
     }
@@ -1267,8 +1448,8 @@ fn is_stale_blockhash_error(err: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use crate::er::{
-        BlockhashSource, ErBlockhash, ErBlockhashPlan, ErOutput, ErRouteInfo, ErSession,
-        ErTelemetry, MockErClient,
+        BlockhashSource, ErBlockhash, ErBlockhashPlan, ErHosts, ErOutput, ErRouteInfo, ErSession,
+        ErTelemetry, MockErClient, SubmitPolicy,
     };
     use solana_program::instruction::{AccountMeta, Instruction};
     use std::sync::Arc;
@@ -1284,10 +1465,15 @@ mod tests {
             fetched_at: Instant::now(),
             cache_hit: false,
         };
+        let hosts = ErHosts {
+            bhfa: route.endpoint.clone(),
+            submit: route.endpoint.clone(),
+        };
         let session = ErSession {
             id: "mock-session".to_string(),
             route: route.clone(),
-            endpoint: route.endpoint.clone(),
+            endpoint: hosts.submit.clone(),
+            hosts,
             accounts: vec![Pubkey::new_unique()],
             started_at: Instant::now(),
             route_duration: Duration::from_millis(5),
@@ -1321,13 +1507,17 @@ mod tests {
                 blockhash_fetched_at: Instant::now(),
             }),
             signature: None,
+            preflight_skipped: false,
+            submit_policy: SubmitPolicy::RouterNoPreflight,
+            final_submit_host: route.endpoint.clone(),
+            parity_retry: false,
         };
 
         mock.push_begin(Ok(session));
         mock.push_execute(Ok(output));
 
         let telemetry = Arc::new(ErTelemetry::default());
-        let ctx = ErExecutionCtx::new(Arc::new(mock), telemetry, true, false, 0, false);
+        let ctx = ErExecutionCtx::new(Arc::new(mock), telemetry, true, false, false, 0, false);
 
         let payer = Pubkey::new_unique();
         let placeholder_intent = UserIntent::new(payer, settlement_ix.clone(), 0, None);

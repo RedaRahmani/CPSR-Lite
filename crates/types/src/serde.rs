@@ -134,7 +134,7 @@ mod tests {
         let key = k();
         let wrap = PkWrap { key };
         let j = serde_json::to_string(&wrap).unwrap();
-        assert!(j.contains(&format!("\"{}\"", key.to_string())));
+    assert!(j.contains(&format!("\"{key}\"")));
         let back: PkWrap = serde_json::from_str(&j).unwrap();
         assert_eq!(back.key, key);
     }

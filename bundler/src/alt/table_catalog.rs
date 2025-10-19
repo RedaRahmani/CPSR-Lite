@@ -32,8 +32,8 @@ impl TableCatalog {
                         continue;
                     }
                     // Decode on-chain ALT state
-                    let mut data_slice: &[u8] = &acc.data;
-                    match AddressLookupTable::deserialize(&mut data_slice) {
+                    let data_slice: &[u8] = &acc.data;
+                    match AddressLookupTable::deserialize(data_slice) {
                         Ok(state) => {
                             let acct = AddressLookupTableAccount {
                                 key: tpk,

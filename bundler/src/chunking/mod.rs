@@ -179,7 +179,7 @@ pub fn chunk_layer(
     budget: &TxBudget,
 ) -> Result<Vec<PlannedChunk>, ChunkError> {
     // Use the smarter oracle by default.
-    let oracle = ProgramAwareOracle::default();
+    let oracle = ProgramAwareOracle;
     chunk_layer_with(layer, intents, budget, &AltPolicy::default(), &oracle)
 }
 
@@ -212,12 +212,10 @@ pub fn chunk_layer_with<O: BudgetOracle>(
             });
         }
 
-        if !cur.can_add(fp) {
-            if !cur.nodes.is_empty() {
-                let chunk = cur.take_planned_chunk();
-                chunks.push(chunk);
-                cur.reset(budget, alt);
-            }
+        if !cur.can_add(fp) && !cur.nodes.is_empty() {
+            let chunk = cur.take_planned_chunk();
+            chunks.push(chunk);
+            cur.reset(budget, alt);
         }
         debug_assert!(cur.can_add(fp));
         cur.add(nid, fp);

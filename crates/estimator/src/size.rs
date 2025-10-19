@@ -27,7 +27,7 @@ fn shortvec_len(n: usize) -> u32 {
 pub fn compiled_ix_bytes(ix: &Instruction) -> u32 {
     let accs = ix.accounts.len();
     let data_len = ix.data.len();
-    (1 + shortvec_len(accs) + accs as u32 + shortvec_len(data_len) + data_len as u32) as u32
+    1 + shortvec_len(accs) + accs as u32 + shortvec_len(data_len) + data_len as u32
 }
 
 pub fn estimate_instruction_size(ix: &Instruction) -> SizeEstimate {

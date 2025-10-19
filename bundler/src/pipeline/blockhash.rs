@@ -127,7 +127,7 @@ impl BlockhashManager {
         let now = Instant::now();
         let (hash, last_valid_block_height) = self
             .rpc
-            .get_latest_blockhash_with_commitment(self.commitment.clone())
+            .get_latest_blockhash_with_commitment(self.commitment)
             .map_err(|e| anyhow!("getLatestBlockhash: {e}"))?;
 
         let lease = BlockhashLease {
@@ -217,7 +217,7 @@ impl BlockhashProvider for BlockhashManager {
                 track_is_blockhash_valid();
                 match self
                     .rpc
-                    .is_blockhash_valid(&lease.hash, self.commitment.clone())
+                    .is_blockhash_valid(&lease.hash, self.commitment)
                 {
                     Ok(true) => {
                         self.metrics

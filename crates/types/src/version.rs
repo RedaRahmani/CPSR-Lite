@@ -121,8 +121,8 @@ mod tests {
             slot: 77,
         };
         let j = serde_json::to_string(&v).unwrap();
-        assert!(j.contains(&format!("\"{}\"", v.key.to_string())));
-        assert!(j.contains(&format!("\"{}\"", v.owner.to_string())));
+    assert!(j.contains(&format!("\"{}\"", v.key)));
+    assert!(j.contains(&format!("\"{}\"", v.owner)));
         let back: AccountVersion = serde_json::from_str(&j).unwrap();
         assert_eq!(back, v);
     }
