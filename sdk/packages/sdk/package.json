@@ -1,0 +1,71 @@
+{
+  "name": "@rlock/cpsr-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for CPSR-Lite - Build, submit, and manage Solana transactions with compute budgets and ALT support",
+  "private": false,
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "NODE_OPTIONS='--experimental-vm-modules' jest",
+    "test:unit": "NODE_OPTIONS='--experimental-vm-modules' jest __tests__/unit",
+    "test:e2e": "NODE_OPTIONS='--experimental-vm-modules' jest __tests__/e2e",
+    "test:parity": "NODE_OPTIONS='--experimental-vm-modules' jest __tests__/parity",
+    "goldens": "npm run test:parity",
+    "smoke": "tsx scripts/smoke.ts",
+    "docs": "typedoc",
+    "lint": "eslint src --ext .ts",
+    "clean": "rm -rf dist docs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "solana",
+    "cpsr",
+    "transaction",
+    "compute-budget",
+    "address-lookup-table",
+    "blockchain"
+  ],
+  "author": "CPSR Team",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RedaRahmani/CPSR-Lite.git",
+    "directory": "sdk/packages/sdk"
+  },
+  "dependencies": {
+    "@solana/spl-memo": "^0.2.5",
+    "@solana/web3.js": "^1.95.3"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.0",
+    "@typescript-eslint/eslint-plugin": "^7.13.0",
+    "@typescript-eslint/parser": "^7.13.0",
+    "eslint": "^8.57.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.5",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.20.6",
+    "typedoc": "^0.26.3",
+    "typescript": "^5.5.2"
+  }
+}

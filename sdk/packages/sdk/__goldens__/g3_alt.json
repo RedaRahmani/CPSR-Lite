@@ -1,0 +1,23 @@
+{
+  "description": "Transaction with Address Lookup Table",
+  "payer": "4KWWvZ8iq2JbPE3qGPr6KtcWvAHwGy3bqMWPnUGNVZDt",
+  "recentBlockhash": "11111111111111111111111111111111",
+  "cuLimit": 1000000,
+  "cuPriceMicrolamports": 5000,
+  "transfers": [
+    {
+      "from": "4KWWvZ8iq2JbPE3qGPr6KtcWvAHwGy3bqMWPnUGNVZDt",
+      "to": "7rjr8gW7pWrw5n3V7qL2vWz5JZP1xKX9YYZ8q3nh8ZZt",
+      "lamports": 250000
+    }
+  ],
+  "alts": {
+    "lookups": [
+      {
+        "tablePubkey": "ALT1111111111111111111111111111111111111111",
+        "writableIndexes": [0, 2],
+        "readonlyIndexes": [1, 3]
+      }
+    ]
+  }
+}
