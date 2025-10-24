@@ -1,0 +1,28 @@
+node_modules/
+dist/
+docs/
+coverage/
+*.log
+.DS_Store
+*.tgz
+
+
+# Config files
+tsconfig.json
+tsconfig.build.json
+jest.config.js
+.eslintrc.json
+typedoc.json
+
+# Scripts
+scripts/
+
+# Build tools
+.tsbuildinfo
+
+# Docs (generated)
+docs/
+
+# Logs & temp files
+*.log
+.DS_Store

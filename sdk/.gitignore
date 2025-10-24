@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+lib/
+out/
+
+# TypeScript
+*.tsbuildinfo
+
+# Coverage & test artifacts
+coverage/
+.nyc_output/
+.jest/
+.jest-cache/
+
+# Caches (tools & bundlers)
+.cache/
+.parcel-cache/
+.turbo/
+.vite/
+.eslintcache
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment & secrets
+.env
+.env.*
+.env.local
+.env.*.local
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Documentation (generated)
+docs/
+
+# Lockfiles in subpackages (monorepo: use root pnpm-lock.yaml)
+packages/*/package-lock.json
+packages/*/yarn.lock
+packages/*/pnpm-lock.yaml
+
+# npm pack tarballs
+*.tgz

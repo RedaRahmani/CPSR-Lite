@@ -1,0 +1,18 @@
+{
+  "description": "Transfer + Memo instruction",
+  "payer": "4KWWvZ8iq2JbPE3qGPr6KtcWvAHwGy3bqMWPnUGNVZDt",
+  "recentBlockhash": "11111111111111111111111111111111",
+  "cuLimit": 1000000,
+  "cuPriceMicrolamports": 5000,
+  "memo": "Parity test memo",
+  "transfers": [
+    {
+      "from": "4KWWvZ8iq2JbPE3qGPr6KtcWvAHwGy3bqMWPnUGNVZDt",
+      "to": "7rjr8gW7pWrw5n3V7qL2vWz5JZP1xKX9YYZ8q3nh8ZZt",
+      "lamports": 500000
+    }
+  ],
+  "alts": {
+    "lookups": []
+  }
+}
