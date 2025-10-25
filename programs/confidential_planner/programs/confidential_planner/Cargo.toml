@@ -1,0 +1,29 @@
+[package]
+name = "confidential_planner"
+version = "0.1.0"
+description = "Created with Arcium & Anchor"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "confidential_planner"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+client = []
+custom-heap = []
+custom-panic = []
+anchor-debug = ["anchor-lang/anchor-debug"]
+full-event-logs = []
+
+[dependencies]
+anchor-lang = { version = "0.31.1", default-features = false, features = ["init-if-needed"] }
+anchor-spl = { version = "0.31.1", default-features = false, features = ["token", "associated_token", "token_2022"] }
+arcium-anchor = "0.3.1"
+arcium-client = { version = "0.3.0", default-features = false }
+encrypted-ixs = { path = "../../encrypted-ixs", default-features = false }
