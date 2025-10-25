@@ -1,5 +1,6 @@
 pub mod alt;
 pub mod chunking;
+pub mod config;
 pub mod dag;
 pub mod er;
 pub mod fee;

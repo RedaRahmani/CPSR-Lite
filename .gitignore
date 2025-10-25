@@ -13,3 +13,4 @@ cpsr_run.json
 er_wiretap
 apps
 .github
+test_mpc.sh

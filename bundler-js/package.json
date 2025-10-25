@@ -1,0 +1,35 @@
+{
+  "name": "bundler-js",
+  "version": "0.1.0",
+  "description": "Node/TS Arcium client for CPSR-Lite encrypted planner",
+  "main": "dist/cli.js",
+  "bin": {
+    "bundler-js": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc && npm run copy-idl",
+    "copy-idl": "mkdir -p dist/idl && cp -f src/idl/*.json dist/idl/ 2>/dev/null || true",
+    "start": "node dist/cli.js",
+    "dev": "ts-node src/cli.ts",
+    "clean": "rm -rf dist",
+    "test": "jest",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": ["arcium", "mpc", "bundler", "cpsr"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@arcium-hq/client": "^0.3.0",
+    "@coral-xyz/anchor": "^0.30.0",
+    "@solana/web3.js": "^1.95.0",
+    "bs58": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.1",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.0"
+  }
+}

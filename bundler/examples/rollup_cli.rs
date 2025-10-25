@@ -3261,4 +3261,111 @@ mod tests {
             "missing execute p95 must produce message"
         );
     }
+
+    /// Test MPC privacy layer integration (dev mode)
+    /// Run with: ARCIUM_ENABLED=true cargo test --example rollup_cli test_mpc_chunking -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore] // Ignore by default - requires ARCIUM_ENABLED=true and bundler-js setup
+    async fn test_mpc_chunking() {
+        use bundler::config::ArciumConfig;
+        use bundler::pipeline::mpc;
+        use solana_program::instruction::Instruction;
+        use solana_sdk::pubkey::Pubkey;
+
+        // Check if MPC is enabled
+        let config = ArciumConfig::from_env();
+        if !config.enabled {
+            println!("⚠️  ARCIUM_ENABLED not set - skipping MPC test");
+            println!("   To run: ARCIUM_ENABLED=true cargo test --example rollup_cli test_mpc_chunking -- --ignored --nocapture");
+            return;
+        }
+
+        println!("🔒 Testing Arcium MPC privacy layer integration");
+        println!("   Program ID: {}", config.program_id);
+        println!("   RPC URL: {}", config.rpc_url);
+        println!("   Cluster: {}", config.cluster);
+
+        // Create 5 test intents
+        let mut intents = Vec::new();
+        for i in 0..5 {
+            let actor = Pubkey::new_unique();
+            let program_id = Pubkey::new_unique();
+            let account1 = Pubkey::new_unique();
+            let account2 = Pubkey::new_unique();
+
+            let ix = Instruction {
+                program_id,
+                accounts: vec![
+                    solana_program::instruction::AccountMeta::new(account1, false),
+                    solana_program::instruction::AccountMeta::new_readonly(account2, false),
+                ],
+                data: vec![i as u8; 32],
+            };
+
+            let intent = UserIntent {
+                actor,
+                ix,
+                accesses: vec![
+                    cpsr_types::intent::AccountAccess {
+                        pubkey: account1,
+                        access: cpsr_types::intent::AccessKind::Writable,
+                    },
+                    cpsr_types::intent::AccountAccess {
+                        pubkey: account2,
+                        access: cpsr_types::intent::AccessKind::ReadOnly,
+                    },
+                ],
+                priority: i,
+                expires_at_slot: None,
+            };
+
+            intents.push(intent);
+        }
+
+        println!("📝 Created {} test intents", intents.len());
+
+        // Call MPC planner
+        println!("🔐 Calling Arcium MPC planner...");
+        let start = Instant::now();
+        
+        let result = mpc::apply_mpc_chunking_or_fallback(&intents, &config).await;
+        
+        let elapsed = start.elapsed();
+        println!("⏱️  MPC call completed in {:?}", elapsed);
+
+        match result {
+            Some(chunks) => {
+                println!("✅ MPC chunking succeeded!");
+                println!("   Input intents: {}", intents.len());
+                println!("   Output chunks: {}", chunks.len());
+                
+                for (i, chunk) in chunks.iter().enumerate() {
+                    println!("   Chunk {}: {} intents", i, chunk.len());
+                }
+
+                // Verify all intents are covered
+                let total_in_chunks: usize = chunks.iter().map(|c| c.len()).sum();
+                assert_eq!(
+                    total_in_chunks, intents.len(),
+                    "All intents should be in output chunks"
+                );
+
+                // For simple test case, expect single chunk (no conflicts)
+                println!("   ℹ️  Note: For non-conflicting intents, expect 1 chunk");
+                if chunks.len() == 1 {
+                    println!("   ✓ Got expected single chunk for simple case");
+                }
+            }
+            None => {
+                println!("⚠️  MPC planner returned None (fallback triggered or disabled)");
+                println!("   This could mean:");
+                println!("   - MPC service unavailable");
+                println!("   - Timeout occurred");
+                println!("   - Invalid configuration");
+                panic!("MPC test failed - check bundler-js setup and Arcium devnet availability");
+            }
+        }
+
+        println!("🎉 MPC integration test completed successfully!");
+    }
 }
