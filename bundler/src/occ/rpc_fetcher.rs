@@ -97,11 +97,15 @@ impl AccountFetcher for RpcAccountFetcher {
 
         // Track acceptance over a sliding window; warn if < 98%.
         {
-            let mut s = self.stats.lock().unwrap();
-            s.record(ok);
-            let pct = s.acceptance_pct();
+            let (pct, window_full) = if let Ok(mut s) = self.stats.lock() {
+                s.record(ok);
+                (s.acceptance_pct(), s.window.len() == s.cap)
+            } else {
+                tracing::warn!(target: "occ", "drift stats mutex poisoned; skipping update");
+                (100.0, false)
+            };
             // Log occasionally when the window is full or on any failure.
-            if !ok || s.window.len() == s.cap {
+            if !ok || window_full {
                 tracing::info!(
                     target: "occ",
                     latest_slot = latest_slot,

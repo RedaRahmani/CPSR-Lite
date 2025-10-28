@@ -1,7 +1,6 @@
 //! A percentile + EMA fee oracle built on `getRecentPrioritizationFees`.
 //! See docs in the file header of your previous version; logic unchanged.
 
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use solana_client::rpc_client::RpcClient;
@@ -11,12 +10,7 @@ use solana_sdk::pubkey::Pubkey;
 use crate::fee::{FeeOracle, FeePlan};
 use crate::sender::track_get_recent_prioritization_fees;
 
-// Global counter (exposed via sender metrics).
-static RPC_GET_RECENT_FEES_COUNT: AtomicU64 = AtomicU64::new(0);
-
-pub fn get_recent_fees_count() -> u64 {
-    RPC_GET_RECENT_FEES_COUNT.load(AtomicOrdering::Relaxed)
-}
+// Metrics are centralized in bundler::sender via track_get_recent_prioritization_fees().
 
 #[derive(Clone)]
 pub struct RecentFeesOracle {
@@ -63,7 +57,6 @@ impl RecentFeesOracle {
             .get_recent_prioritization_fees(&self.probe_accounts)
         {
             Ok(list) if !list.is_empty() => {
-                RPC_GET_RECENT_FEES_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
                 list.into_iter()
                     .map(|RpcPrioritizationFee { prioritization_fee, .. }| prioritization_fee)
                     .collect()

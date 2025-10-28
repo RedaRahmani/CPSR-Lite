@@ -209,10 +209,19 @@ impl ReliableSender {
 
         // 3) Update stats and compute P95 envelope.
         {
-            let mut s = self.stats.lock().expect("cu stats mutex");
-            s.record(used);
+            if let Ok(mut s) = self.stats.lock() {
+                s.record(used);
+            } else {
+                tracing::warn!(target: "fee", "cu stats mutex poisoned; skipping record");
+            }
         }
-        let p95_used = self.stats.lock().unwrap().p95().unwrap_or(used);
+        let p95_used = match self.stats.lock() {
+            Ok(guard) => guard.p95().unwrap_or(used),
+            Err(_) => {
+                tracing::warn!(target: "fee", "cu stats mutex poisoned; using last used for P95");
+                used
+            }
+        };
         let target_limit = p95_used.max(used); // conservative
 
         // 4) Apply safety (+10k +20%, clamped to oracle’s max limit).

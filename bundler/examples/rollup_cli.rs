@@ -62,6 +62,7 @@ use estimator::config::SafetyMargins;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
+use colored::Colorize;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -625,7 +626,7 @@ struct Args {
     max_cu_limit: Option<u64>,
 
     /// Use LUTs during planning (still resolved by AltManager)
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     enable_alt: bool,
 
     /// Cache TTL for ALT selections (ms).
@@ -749,7 +750,7 @@ struct Args {
     er_route_ttl_ms: u64,
 
     /// Blockhash cache TTL (ms)
-    #[arg(long, default_value_t = 2_000)]
+    #[arg(long, default_value_t = 10_000)]
     er_blockhash_ttl_ms: u64,
 
     /// Requested ER session lifetime (ms) (kept for compatibility; not used by preflight)
@@ -788,6 +789,10 @@ struct Args {
     /// Which run mode to execute: er-only | baseline-only | compare
     #[arg(long, value_enum, default_value_t = RunMode::Compare)]
     mode: RunMode,
+
+    /// Print ASCII graphs comparing ER vs Baseline (fees/CU/latency)
+    #[arg(long, default_value_t = false)]
+    graph: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2793,7 +2798,102 @@ fn print_compare_reports(
         er_result.plan_fingerprint_coverage * 100.0
     );
 
+    // Optional signature summaries inside comparison summary
+    if args.print_sigs {
+        println!(
+            "ER Sigs: {}",
+            summarize_sigs(&er_result.signatures, 3)
+        );
+        println!(
+            "Baseline Sigs: {}",
+            summarize_sigs(&baseline_result.signatures, 3)
+        );
+    }
+
+    // Optional self-check warnings
+    let fee_savings_ratio = if baseline_result.fee_total > 0 {
+        (fee_delta as f64 / baseline_result.fee_total as f64).max(0.0)
+    } else {
+        0.0
+    };
+    let exec_p95 = er_result.er_exec_stats.p95_ms;
+    let failures = fee_based_self_check_failures(fee_savings_ratio, exec_p95);
+    if !failures.is_empty() {
+        println!("\n{}", "SELF-CHECK WARNINGS".red().bold());
+        for msg in failures {
+            println!("- {}", msg.red());
+        }
+    }
+
+    // ASCII graphs when requested
+    if args.graph {
+        println!("\n=== GRAPHS ===");
+        // Fees
+        draw_pair_bars(
+            "Fees (lamports)",
+            er_result.er_fee_total,
+            baseline_result.fee_total,
+            "lam",
+        );
+        // CU totals
+        draw_pair_bars(
+            "Compute Units",
+            er_result.er_cu_total,
+            baseline_cu_total,
+            "cu",
+        );
+        // Latency p95
+        let er_p95 = er_result
+            .er_latency_stats
+            .p95_ms
+            .unwrap_or(0.0)
+            .round() as u64;
+        let bl_p95 = baseline_result
+            .latency_stats
+            .p95_ms
+            .unwrap_or(0.0)
+            .round() as u64;
+        draw_pair_bars("Latency p95 (ms)", er_p95, bl_p95, "ms");
+    }
+
     Ok(())
+}
+
+fn draw_pair_bars(title: &str, er: u64, baseline: u64, unit: &str) {
+    let maxv = er.max(baseline).max(1);
+    let width = 40usize;
+    println!("{}", title.bold());
+    let er_bar_len = ((er as f64 / maxv as f64) * width as f64).round() as usize;
+    let bl_bar_len = ((baseline as f64 / maxv as f64) * width as f64).round() as usize;
+    let er_bar = "|".repeat(er_bar_len);
+    let bl_bar = "|".repeat(bl_bar_len);
+    let er_line = format!("ER       : {:<width$}  {} {}", er_bar, er, unit, width = width);
+    let bl_line = format!("Baseline : {:<width$}  {} {}", bl_bar, baseline, unit, width = width);
+    // Colorize: green when ER <= baseline, red otherwise
+    if er <= baseline {
+        println!("{}", er_line.green());
+    } else {
+        println!("{}", er_line.red());
+    }
+    println!("{}", bl_line.yellow());
+}
+
+fn summarize_sigs(sigs: &[String], first_n: usize) -> String {
+    if sigs.is_empty() {
+        return "<none>".to_string();
+    }
+    let shown = sigs
+        .iter()
+        .take(first_n)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remaining = sigs.len().saturating_sub(first_n);
+    if remaining > 0 {
+        format!("{} (+{} more)", shown, remaining)
+    } else {
+        shown
+    }
 }
 
 fn er_report_json(result: &ErRunResult, tracing: &TracingReport) -> serde_json::Value {

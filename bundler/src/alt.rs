@@ -228,14 +228,17 @@ impl CachingAltManager {
             selected.sort();
             let cache_key = CacheKey::from_pubkeys(&selected);
 
-            let mut cache = self.cache.lock().expect("alt cache mutex");
-            cache.insert(
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.insert(
                 cache_key,
                 CacheEntry {
                     resolution: resolution.clone(),
                     expires_at: Instant::now() + self.ttl,
                 },
             );
+            } else {
+                tracing::warn!(target: "alt", "cache mutex poisoned while inserting real-catalog result");
+            }
 
             return resolution;
         }
@@ -244,15 +247,18 @@ impl CachingAltManager {
         offload.sort_by_key(|k| k.pubkey);
         let cache_key = CacheKey::from(&offload);
 
-        let mut cache = self.cache.lock().expect("alt cache mutex");
-        if let Some(entry) = cache.get(&cache_key) {
-            if entry.expires_at > Instant::now() {
-                let mut cached = entry.resolution.clone();
-                cached.cache_hit = true;
-                return cached;
-            } else {
-                cache.remove(&cache_key);
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.expires_at > Instant::now() {
+                    let mut cached = entry.resolution.clone();
+                    cached.cache_hit = true;
+                    return cached;
+                } else {
+                    cache.remove(&cache_key);
+                }
             }
+        } else {
+            tracing::warn!(target: "alt", "cache mutex poisoned during lookup");
         }
 
         let addresses: Vec<Pubkey> = offload.iter().map(|u| u.pubkey).collect();
@@ -275,13 +281,17 @@ impl CachingAltManager {
             cache_hit: false,
         };
 
-        cache.insert(
-            cache_key,
-            CacheEntry {
-                resolution: resolution.clone(),
-                expires_at: Instant::now() + self.ttl,
-            },
-        );
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(
+                cache_key,
+                CacheEntry {
+                    resolution: resolution.clone(),
+                    expires_at: Instant::now() + self.ttl,
+                },
+            );
+        } else {
+            tracing::warn!(target: "alt", "cache mutex poisoned during insert");
+        }
 
         resolution
     }
@@ -296,7 +306,13 @@ impl AltManager for CachingAltManager {
             // No change
         }
 
-        let mut metrics = self.metrics.lock().expect("alt metrics mutex");
+        let mut metrics = match self.metrics.lock() {
+            Ok(m) => m,
+            Err(_) => {
+                tracing::warn!(target: "alt", "metrics mutex poisoned; skipping update");
+                return resolution;
+            }
+        };
         metrics.total_resolutions += 1;
         if resolution.cache_hit {
             metrics.cache_hits += 1;
@@ -310,7 +326,12 @@ impl AltManager for CachingAltManager {
     }
 
     fn metrics(&self) -> AltMetrics {
-        self.metrics.lock().expect("alt metrics mutex").clone()
+        self
+            .metrics
+            .lock()
+            .ok()
+            .map(|guard| (*guard).clone())
+            .unwrap_or_default()
     }
 }
 

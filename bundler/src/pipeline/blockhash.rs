@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -97,6 +98,8 @@ pub struct BlockhashManager {
     pre_check: bool,
     state: Mutex<BlockhashInner>,
     metrics: Mutex<BlockhashMetrics>,
+    /// Coalesces concurrent refresh attempts so only one caller hits RPC at a time.
+    refresh_in_flight: AtomicBool,
 }
 
 impl BlockhashManager {
@@ -119,34 +122,24 @@ impl BlockhashManager {
                 pending_refresh: Some(RefreshReason::Initial),
             }),
             metrics: Mutex::new(BlockhashMetrics::default()),
+            refresh_in_flight: AtomicBool::new(false),
         }
     }
 
-    fn refresh_with_reason(&self, inner: &mut BlockhashInner, reason: RefreshReason) -> Result<()> {
+    /// Perform an RPC fetch for a fresh blockhash. Network happens outside locks.
+    fn fetch_lease(&self, reason: RefreshReason) -> Result<BlockhashLease> {
         track_get_latest_blockhash();
         let now = Instant::now();
         let (hash, last_valid_block_height) = self
             .rpc
             .get_latest_blockhash_with_commitment(self.commitment)
             .map_err(|e| anyhow!("getLatestBlockhash: {e}"))?;
-
-        let lease = BlockhashLease {
+        Ok(BlockhashLease {
             hash,
             last_valid_block_height,
             fetched_at: now,
             refresh_reason: reason,
-        };
-
-        self.bump_refresh_metric(reason);
-        self.log_refresh(&lease, reason);
-
-        inner.current = Some(BlockhashState {
-            lease,
-            uses_since_refresh: 0,
-        });
-        inner.pending_refresh = None;
-
-        Ok(())
+        })
     }
 
     fn check_policy(&self, state: &BlockhashState) -> Option<RefreshReason> {
@@ -163,7 +156,13 @@ impl BlockhashManager {
     }
 
     fn bump_refresh_metric(&self, reason: RefreshReason) {
-        let mut metrics = self.metrics.lock().expect("blockhash metrics mutex");
+        let mut metrics = match self.metrics.lock() {
+            Ok(m) => m,
+            Err(_) => {
+                tracing::warn!(target: "blockhash", "metrics mutex poisoned in bump_refresh_metric");
+                return;
+            }
+        };
         match reason {
             RefreshReason::Initial => metrics.refresh_initial += 1,
             RefreshReason::Manual => metrics.refresh_manual += 1,
@@ -189,28 +188,84 @@ impl BlockhashManager {
 impl BlockhashProvider for BlockhashManager {
     async fn lease(&self) -> Result<BlockhashLease> {
         loop {
-            let (lease, needs_check) = {
-                let mut inner = self.state.lock().expect("blockhash state mutex");
-
+            // Determine whether a refresh is needed (brief critical section)
+            let need_refresh: Option<RefreshReason> = if let Ok(mut inner) = self.state.lock() {
                 if let Some(reason) = inner.pending_refresh.take() {
-                    self.refresh_with_reason(&mut inner, reason)?;
+                    Some(reason)
+                } else if let Some(state) = inner.current.as_ref() {
+                    self.check_policy(state)
+                } else {
+                    Some(RefreshReason::Initial)
                 }
+            } else {
+                // If mutex is poisoned, try to refresh to recover.
+                Some(RefreshReason::Initial)
+            };
 
-                if let Some(state) = inner.current.as_ref() {
-                    if let Some(reason) = self.check_policy(state) {
-                        self.refresh_with_reason(&mut inner, reason)?;
+            if let Some(reason) = need_refresh {
+                // Coalesce concurrent refreshers.
+                if self
+                    .refresh_in_flight
+                    .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                    .is_ok()
+                {
+                    // We perform the fetch without holding the state lock.
+                    match self.fetch_lease(reason) {
+                        Ok(lease) => {
+                            self.bump_refresh_metric(reason);
+                            self.log_refresh(&lease, reason);
+                            if let Ok(mut inner) = self.state.lock() {
+                                inner.current = Some(BlockhashState {
+                                    lease,
+                                    uses_since_refresh: 0,
+                                });
+                                inner.pending_refresh = None;
+                            } else {
+                                tracing::warn!(target: "blockhash", "state mutex poisoned while updating after refresh");
+                            }
+                        }
+                        Err(e) => {
+                            // Allow other waiters to retry.
+                            self.refresh_in_flight.store(false, AtomicOrdering::Release);
+                            return Err(e);
+                        }
                     }
+                    // Release refresh flag so others can proceed.
+                    self.refresh_in_flight.store(false, AtomicOrdering::Release);
+                } else {
+                    // Another task is already refreshing; wait briefly and retry.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
+                continue;
+            }
 
-                if inner.current.is_none() {
-                    self.refresh_with_reason(&mut inner, RefreshReason::Initial)?;
+            // No refresh needed; issue a lease and optionally pre-check.
+            let (lease, needs_check) = {
+                if let Ok(mut inner) = self.state.lock() {
+                    if inner.current.is_none() {
+                        // Defensive: trigger refresh path on next loop
+                        inner.pending_refresh = Some(RefreshReason::Initial);
+                        (BlockhashLease {
+                            hash: Hash::default(),
+                            last_valid_block_height: 0,
+                            fetched_at: Instant::now(),
+                            refresh_reason: RefreshReason::Initial,
+                        }, false)
+                    } else {
+                        let state = inner.current.as_mut().expect("guarded by is_none check");
+                        state.uses_since_refresh = state.uses_since_refresh.saturating_add(1);
+                        let lease = state.lease;
+                        let needs_check = self.pre_check && state.uses_since_refresh > 1;
+                        (lease, needs_check)
+                    }
+                } else {
+                    // If poisoned, force a refresh on next loop
+                    let mut inner = self.state.lock().ok();
+                    if let Some(ref mut g) = inner {
+                        g.pending_refresh = Some(RefreshReason::Initial);
+                    }
+                    continue;
                 }
-
-                let state = inner.current.as_mut().expect("blockhash state populated");
-                state.uses_since_refresh = state.uses_since_refresh.saturating_add(1);
-                let lease = state.lease;
-                let needs_check = self.pre_check && state.uses_since_refresh > 1;
-                (lease, needs_check)
             };
 
             if needs_check {
@@ -220,28 +275,29 @@ impl BlockhashProvider for BlockhashManager {
                     .is_blockhash_valid(&lease.hash, self.commitment)
                 {
                     Ok(true) => {
-                        self.metrics
-                            .lock()
-                            .expect("blockhash metrics mutex")
-                            .leases_issued += 1;
+                        if let Ok(mut m) = self.metrics.lock() {
+                            m.leases_issued += 1;
+                        }
                         return Ok(lease);
                     }
                     Ok(false) => {
                         // Gentle anti-spin: avoid a tight loop against flaky RPCs.
                         tokio::time::sleep(Duration::from_millis(25)).await;
                         warn!(target: "blockhash", "blockhash invalidated; fetching a new one");
-                        let mut inner = self.state.lock().expect("blockhash state mutex");
-                        inner.current = None;
-                        inner.pending_refresh = Some(RefreshReason::ValidationFailed);
+                        if let Ok(mut inner) = self.state.lock() {
+                            inner.current = None;
+                            inner.pending_refresh = Some(RefreshReason::ValidationFailed);
+                        } else {
+                            tracing::warn!(target: "blockhash", "state mutex poisoned while setting validation failed; will retry");
+                        }
                         continue;
                     }
                     Err(err) => return Err(anyhow!("isBlockhashValid: {err}")),
                 }
             } else {
-                self.metrics
-                    .lock()
-                    .expect("blockhash metrics mutex")
-                    .leases_issued += 1;
+                if let Ok(mut m) = self.metrics.lock() {
+                    m.leases_issued += 1;
+                }
                 return Ok(lease);
             }
         }
@@ -249,27 +305,30 @@ impl BlockhashProvider for BlockhashManager {
 
     fn record_outcome(&self, lease: &BlockhashLease, outcome: LeaseOutcome) {
         if matches!(outcome, LeaseOutcome::StaleDetected) {
-            self.metrics
-                .lock()
-                .expect("blockhash metrics mutex")
-                .stale_detected += 1;
-            let mut inner = self.state.lock().expect("blockhash state mutex");
-            inner.current = None;
-            inner.pending_refresh = Some(RefreshReason::Manual);
+            if let Ok(mut m) = self.metrics.lock() {
+                m.stale_detected += 1;
+            }
+            if let Ok(mut inner) = self.state.lock() {
+                inner.current = None;
+                inner.pending_refresh = Some(RefreshReason::Manual);
+            }
             warn!(target: "blockhash", hash = %lease.hash, "stale blockhash detected; forcing refresh");
         }
     }
 
     fn mark_layer_boundary(&self) {
-        let mut inner = self.state.lock().expect("blockhash state mutex");
-        inner.pending_refresh = Some(RefreshReason::LayerBoundary);
+        if let Ok(mut inner) = self.state.lock() {
+            inner.pending_refresh = Some(RefreshReason::LayerBoundary);
+        }
     }
 
     fn metrics(&self) -> BlockhashMetrics {
-        self.metrics
+        self
+            .metrics
             .lock()
-            .expect("blockhash metrics mutex")
-            .clone()
+            .ok()
+            .map(|guard| (*guard).clone())
+            .unwrap_or_default()
     }
 }
 

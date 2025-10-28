@@ -6,7 +6,7 @@
 //! defines the common client interface and a Router-resolving implementation
 //! that aligns with `docs.magicblock.gg` (router discovery + stateless routing).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
@@ -45,6 +45,9 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use std::sync::Arc;
+
+// Keep a bounded number of latency samples to avoid unbounded memory growth.
+const TELEMETRY_WINDOW: usize = 1000;
 
 /// Developer note:
 /// curl --silent https://devnet-router.magicblock.app/getRoutes \
@@ -230,9 +233,9 @@ pub struct ErTelemetry {
     bhfa_err: AtomicU64,
     router_simulate: AtomicU64,
     router_send: AtomicU64,
-    route_ms: Mutex<Vec<u128>>,
-    bhfa_ms: Mutex<Vec<u128>>,
-    exec_ms: Mutex<Vec<u128>>,
+    route_ms: Mutex<VecDeque<u128>>,
+    bhfa_ms: Mutex<VecDeque<u128>>,
+    exec_ms: Mutex<VecDeque<u128>>,
     exec_ok: AtomicU64,
     exec_err: AtomicU64,
     router_cache_hits: AtomicU64,
@@ -345,7 +348,10 @@ impl ErTelemetry {
             self.routes_ok.fetch_add(1, Ordering::Relaxed);
             if let Some(dur) = duration {
                 if let Ok(mut samples) = self.route_ms.lock() {
-                    samples.push(dur.as_millis());
+                    samples.push_back(dur.as_millis());
+                    while samples.len() > TELEMETRY_WINDOW {
+                        samples.pop_front();
+                    }
                 }
             }
         } else {
@@ -363,7 +369,10 @@ impl ErTelemetry {
     pub fn record_bhfa_success(&self, duration: Duration) {
         self.bhfa_ok.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut samples) = self.bhfa_ms.lock() {
-            samples.push(duration.as_millis());
+            samples.push_back(duration.as_millis());
+            while samples.len() > TELEMETRY_WINDOW {
+                samples.pop_front();
+            }
         }
     }
 
@@ -380,7 +389,10 @@ impl ErTelemetry {
             self.exec_ok.fetch_add(1, Ordering::Relaxed);
             if let Some(dur) = duration {
                 if let Ok(mut samples) = self.exec_ms.lock() {
-                    samples.push(dur.as_millis());
+                    samples.push_back(dur.as_millis());
+                    while samples.len() > TELEMETRY_WINDOW {
+                        samples.pop_front();
+                    }
                 }
             }
         } else {
@@ -503,9 +515,21 @@ impl ErTelemetry {
             .map(|m| m.clone())
             .unwrap_or(None);
 
-        let route_ms = self.route_ms.lock().map(|v| v.clone()).unwrap_or_default();
-        let bhfa_ms = self.bhfa_ms.lock().map(|v| v.clone()).unwrap_or_default();
-        let exec_ms = self.exec_ms.lock().map(|v| v.clone()).unwrap_or_default();
+        let route_ms: Vec<u128> = self
+            .route_ms
+            .lock()
+            .map(|v| v.iter().copied().collect())
+            .unwrap_or_default();
+        let bhfa_ms: Vec<u128> = self
+            .bhfa_ms
+            .lock()
+            .map(|v| v.iter().copied().collect())
+            .unwrap_or_default();
+        let exec_ms: Vec<u128> = self
+            .exec_ms
+            .lock()
+            .map(|v| v.iter().copied().collect())
+            .unwrap_or_default();
         let router_error_kinds = self
             .router_error_kinds
             .lock()
@@ -1034,15 +1058,22 @@ impl ErHttpClientInner {
             fetched_at: fresh.fetched_at,
             cache_hit: false,
         };
-        {
-            let mut cache_guard = self.route_cache.lock().expect("route cache poisoned");
+        if let Ok(mut cache_guard) = self.route_cache.lock() {
             *cache_guard = Some(fresh);
+        } else {
+            warn!(target: "er", "route cache mutex poisoned while inserting fresh route");
         }
         Ok(info)
     }
 
     fn cached_route(&self) -> Option<ErRouteInfo> {
-        let mut cache_guard = self.route_cache.lock().expect("route cache poisoned");
+        let mut cache_guard = match self.route_cache.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                warn!(target: "er", "route cache mutex poisoned; ignoring cached route");
+                return None;
+            }
+        };
         match cache_guard.as_ref() {
             Some(entry) if entry.fetched_at + entry.ttl > Instant::now() => Some(ErRouteInfo {
                 endpoint: entry.endpoint.clone(),
@@ -1113,42 +1144,54 @@ impl ErHttpClientInner {
         api_key_header: Option<&HeaderValue>,
     ) -> Result<JsonResponse> {
         let apply_circuit = self.should_apply_circuit(url) && self.cfg.circuit_breaker_failures > 0;
+        // Whether we should attempt post-send circuit updates
+        let mut allow_circuit_updates = false;
 
         if apply_circuit {
-            let mut circ = self.circuit.lock().expect("circuit poisoned");
-            if let Some(until) = circ.is_tripped() {
-                let remaining = until.saturating_duration_since(Instant::now());
-                bail!(
-                    "router circuit breaker is tripped; retry after {:?}",
-                    remaining
-                );
+            match self.circuit.lock() {
+                Ok(mut circ) => {
+                    if let Some(until) = circ.is_tripped() {
+                        let remaining = until.saturating_duration_since(Instant::now());
+                        bail!("router circuit breaker is tripped; retry after {:?}", remaining);
+                    }
+                    allow_circuit_updates = true;
+                }
+                Err(_) => {
+                    warn!(target: "er", "circuit mutex poisoned; bypassing breaker pre-check");
+                    allow_circuit_updates = false;
+                }
             }
         }
 
+        // Perform network send (no circuit guard held across await)
         let result = self.send_with_retries(url, body, api_key_header).await;
 
-        if apply_circuit {
-            let mut circ = self.circuit.lock().expect("circuit poisoned");
-            match &result {
-                Ok(_) => {
-                    if circ.reset() {
-                        debug!(target: "er", "router circuit breaker reset");
+        // Post-send circuit accounting
+        if apply_circuit && allow_circuit_updates {
+            if let Ok(mut circ) = self.circuit.lock() {
+                match &result {
+                    Ok(_) => {
+                        if circ.reset() {
+                            debug!(target: "er", "router circuit breaker reset");
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(until) = circ.record_failure(
+                            self.cfg.circuit_breaker_failures,
+                            self.cfg.circuit_breaker_cooldown,
+                        ) {
+                            warn!(
+                                target: "er",
+                                retry_after_ms = self.cfg.circuit_breaker_cooldown.as_millis(),
+                                failures = self.cfg.circuit_breaker_failures,
+                                "router circuit breaker opened; suppressing requests until {:?}",
+                                until
+                            );
+                        }
                     }
                 }
-                Err(_) => {
-                    if let Some(until) = circ.record_failure(
-                        self.cfg.circuit_breaker_failures,
-                        self.cfg.circuit_breaker_cooldown,
-                    ) {
-                        warn!(
-                            target: "er",
-                            retry_after_ms = self.cfg.circuit_breaker_cooldown.as_millis(),
-                            failures = self.cfg.circuit_breaker_failures,
-                            "router circuit breaker opened; suppressing requests until {:?}",
-                            until
-                        );
-                    }
-                }
+            } else {
+                warn!(target: "er", "circuit mutex poisoned; skipping circuit update");
             }
         }
 
@@ -2117,6 +2160,8 @@ impl ErHttpClientInner {
                     }
                 }
                 *guard = None;
+            } else {
+                warn!(target: "er", "blockhash cache mutex poisoned; bypassing cache");
             }
         }
 
